@@ -74,7 +74,8 @@ public class SqlRepositoryIntegrationTests
     {
         // Amounts grow with the clock, so this run's players lead the list even against
         // players left behind by earlier runs or by the Tester.
-        var baseAmount = DateTime.UtcNow.Ticks / 10_000m;
+        // Whole number, so halving it never produces a fifth decimal place that rounds differently per wager.
+        decimal baseAmount = DateTime.UtcNow.Ticks / 10_000;
         var big = Guid.NewGuid();
         var bigger = Guid.NewGuid();
         await _writer.WriteBatchAsync(
