@@ -49,6 +49,3 @@ app.MapHealthChecks("/health/live", new HealthCheckOptions { Predicate = _ => fa
 app.MapHealthChecks("/health/ready", new HealthCheckOptions { Predicate = r => r.Tags.Contains(ServiceCollectionExtensions.ReadyTag) });
 
 app.Run();
-
-/// <summary>Exposed for integration testing with WebApplicationFactory.</summary>
-public partial class Program;

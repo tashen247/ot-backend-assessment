@@ -5,7 +5,7 @@ namespace OT.Assessment.Core.Messaging;
 /// (including fields the database does not store, such as <see cref="SessionData"/>) so the
 /// queue remains a faithful record of what was received and new consumers can use it later.
 /// </summary>
-public sealed class CasinoWagerMessage
+public sealed record CasinoWagerMessage
 {
     public Guid WagerId { get; init; }
     public string Theme { get; init; }
