@@ -24,6 +24,7 @@ public sealed class RabbitMqCasinoWagerPublisher : ICasinoWagerPublisher, IAsync
     private readonly RabbitMqConnectionProvider _connectionProvider;
     private readonly RabbitMqOptions _options;
     private readonly Channel<IAmqpChannel> _pool;
+    private readonly int _poolSize;
     private readonly SemaphoreSlim _topologyLock = new(1, 1);
     private volatile bool _topologyDeclared;
 
@@ -32,9 +33,9 @@ public sealed class RabbitMqCasinoWagerPublisher : ICasinoWagerPublisher, IAsync
         _connectionProvider = connectionProvider;
         _options = options.Value;
 
-        var poolSize = Math.Max(1, _options.PublisherChannelPoolSize);
-        _pool = Channel.CreateBounded<IAmqpChannel>(poolSize);
-        for (var i = 0; i < poolSize; i++)
+        _poolSize = Math.Max(1, _options.PublisherChannelPoolSize);
+        _pool = Channel.CreateBounded<IAmqpChannel>(_poolSize);
+        for (var i = 0; i < _poolSize; i++)
         {
             _pool.Writer.TryWrite(null); // empty slot, filled on first use
         }
@@ -73,6 +74,37 @@ public sealed class RabbitMqCasinoWagerPublisher : ICasinoWagerPublisher, IAsync
         finally
         {
             _pool.Writer.TryWrite(channel);
+        }
+    }
+
+    /// <summary>
+    /// Opens the connection, declares the topology and fills every pool slot, so the first burst
+    /// of requests after start-up does not pay for it.
+    /// </summary>
+    public async Task WarmUpAsync(CancellationToken cancellationToken)
+    {
+        var rented = new List<IAmqpChannel>();
+        try
+        {
+            while (rented.Count < _poolSize)
+            {
+                rented.Add(await _pool.Reader.ReadAsync(cancellationToken));
+            }
+
+            for (var i = 0; i < rented.Count; i++)
+            {
+                if (rented[i] is null || rented[i].IsClosed)
+                {
+                    rented[i] = await OpenChannelAsync(cancellationToken);
+                }
+            }
+        }
+        finally
+        {
+            foreach (var channel in rented)
+            {
+                _pool.Writer.TryWrite(channel);
+            }
         }
     }
 

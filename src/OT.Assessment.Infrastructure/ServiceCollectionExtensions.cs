@@ -37,10 +37,12 @@ public static class ServiceCollectionExtensions
         return services;
     }
 
-    /// <summary>Registers the confirmed, channel-pooled wager publisher.</summary>
+    /// <summary>Registers the confirmed, channel-pooled wager publisher and warms it at start-up.</summary>
     public static IServiceCollection AddRabbitMqPublisher(this IServiceCollection services)
     {
-        services.AddSingleton<ICasinoWagerPublisher, RabbitMqCasinoWagerPublisher>();
+        services.AddSingleton<RabbitMqCasinoWagerPublisher>();
+        services.AddSingleton<ICasinoWagerPublisher>(sp => sp.GetRequiredService<RabbitMqCasinoWagerPublisher>());
+        services.AddHostedService<RabbitMqPublisherWarmupService>();
         return services;
     }
 
