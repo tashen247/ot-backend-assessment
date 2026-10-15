@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore
+        run: dotnet restore OT.Assessment.sln
+
+      - name: Build
+        run: dotnet build OT.Assessment.sln --configuration Release --no-restore
+
+      # SQL Server integration tests are skipped unless OT_TEST_SQL_CONNECTION is set.
+      - name: Test
+        run: dotnet test test/OT.Assessment.UnitTests --configuration Release --no-build --logger "console;verbosity=normal"

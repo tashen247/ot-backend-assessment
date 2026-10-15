@@ -1,7 +1,9 @@
-@hostAddress = http://localhost:5021
+@hostAddress = https://localhost:7120
+@playerId = 5ac75fec-23e9-27d1-b660-179eee70003d
 
-POST {{hostAddress}}/api/Player/CasinoWager
+POST {{hostAddress}}/api/player/casinowager
 Content-Type: application/json
+
 {
   "wagerId": "aa6700eb-1a06-483e-9739-d293dc7a9383",
   "theme": "adventure",
@@ -18,7 +20,17 @@ Content-Type: application/json
   "numberOfBets": 3,
   "countryCode": "BS",
   "sessionData": "Central Chile Awesome Cotton Gloves cross-platform Handmade Rubber Shoes portals leading-edge Coordinator Data Producer end-to-end encoding Gorgeous Clothing View Health, Outdoors & Music embrace Metrics Facilitator morph",
-  "Duration": 1827254
+  "duration": 1827254
 }
+
 ###
 
+GET {{hostAddress}}/api/player/{{playerId}}/casino?pageSize=10&page=1
+
+###
+
+GET {{hostAddress}}/api/player/topSpenders?count=10
+
+###
+
+GET {{hostAddress}}/health/ready

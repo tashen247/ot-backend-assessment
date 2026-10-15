@@ -1,0 +1,29 @@
+# Local infrastructure for the OT assessment.
+#
+#   docker compose up -d                 -> RabbitMQ only (use your local SQL Server and the default connection string)
+#   docker compose --profile sql up -d   -> RabbitMQ and SQL Server 2022 (see Notes.md for the connection string override)
+#
+# RabbitMQ management UI: http://localhost:15672 (guest / guest)
+
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: ot-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: ot-sqlserver
+    profiles: ["sql"]
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "OtAssess!2026"
+    ports:
+      - "1433:1433"
