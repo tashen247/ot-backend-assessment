@@ -209,10 +209,18 @@ BEGIN
                        WHERE pl.AccountId = b.AccountId)
     GROUP BY b.AccountId;
 
-    -- 4. Insert the wagers against their surrogate keys.
+    -- 4. Insert the wagers against their surrogate keys. The rows actually written, not the
+    --    rows offered, are what the totals and the returned count are based on.
+    DECLARE @Inserted TABLE
+    (
+        WagerId UNIQUEIDENTIFIER NOT NULL,
+        Amount  DECIMAL(19,4)    NOT NULL
+    );
+
     INSERT INTO dbo.CasinoWager
         (WagerId, PlayerId, GameId, TransactionId, TransactionTypeId, BrandId, ExternalReferenceId,
          Amount, NumberOfBets, CountryCode, DurationMs, CreatedDateTime)
+    OUTPUT inserted.WagerId, inserted.Amount INTO @Inserted (WagerId, Amount)
     SELECT b.WagerId, pl.PlayerId, g.GameId, b.TransactionId, b.TransactionTypeId, b.BrandId,
            b.ExternalReferenceId, b.Amount, b.NumberOfBets, b.CountryCode, b.DurationMs, b.CreatedDateTime
     FROM   #Batch AS b
@@ -220,18 +228,32 @@ BEGIN
            INNER JOIN dbo.Provider AS p  ON p.Name       = b.ProviderName
            INNER JOIN dbo.Game     AS g  ON g.ProviderId = p.ProviderId AND g.Name = b.GameName;
 
-    -- 5. Roll the new wagers into the per-player running totals.
+    -- A row still in #Batch that did not insert failed a join. Fail the transaction so the
+    -- caller can write the batch one row at a time. Totals must not count a wager that was not stored.
+    IF EXISTS (
+        SELECT 1
+        FROM   #Batch AS b
+        WHERE  NOT EXISTS (SELECT 1 FROM @Inserted AS i WHERE i.WagerId = b.WagerId)
+    )
+    BEGIN
+        THROW 50001, 'A wager in the batch could not be stored.', 1;
+    END
+
+    -- 5. Roll the inserted wagers into the per-player running totals.
     UPDATE pl
     SET    pl.TotalAmountSpent = pl.TotalAmountSpent + t.Amount,
            pl.TotalWagerCount  = pl.TotalWagerCount  + t.WagerCount
     FROM   dbo.Player AS pl
-           INNER JOIN (SELECT AccountId, SUM(Amount) AS Amount, COUNT(*) AS WagerCount
-                       FROM   #Batch
-                       GROUP BY AccountId) AS t ON t.AccountId = pl.AccountId;
+           INNER JOIN (
+               SELECT b.AccountId, SUM(i.Amount) AS Amount, COUNT(*) AS WagerCount
+               FROM   @Inserted AS i
+                      INNER JOIN #Batch AS b ON b.WagerId = i.WagerId
+               GROUP BY b.AccountId
+           ) AS t ON t.AccountId = pl.AccountId;
 
     COMMIT TRANSACTION;
 
-    SELECT COUNT(*) AS InsertedCount FROM #Batch;
+    SELECT COUNT(*) AS InsertedCount FROM @Inserted;
 END
 GO
 
