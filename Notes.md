@@ -43,7 +43,7 @@ $env:ConnectionStrings__DatabaseConnection = "Server=localhost,1433;Database=OT_
 2. Start **OT.Assessment.Consumer**.
 3. Run **OT.Assessment.Tester**.
 
-The exchange, queue and dead-letter queue are declared automatically by whichever process starts first. `GET /health/ready` reports whether SQL Server and RabbitMQ are reachable.
+The exchange, queue and dead-letter queue are declared automatically by whichever process starts first. If either process logs `PRECONDITION_FAILED - inequivalent arg` for `ot.casino.wagers`, the broker still has that queue from a run with different queue settings: delete the queue in the management UI (Queues › ot.casino.wagers › Delete), or recreate the RabbitMQ container, and start again. `GET /health/ready` reports whether SQL Server and RabbitMQ are reachable.
 
 > **About the row count after a Tester run:** expect slightly fewer than 7,000 rows in `dbo.CasinoWager`, typically about 6,930–6,970. The Tester sends some wagers twice; nothing is lost. See [section 5](#5-things-i-found-in-the-boilerplate). The consumer log reports duplicates on every batch (`... 5 already stored ...`), and this query proves every distinct wager is stored exactly once:
 > ```sql
@@ -88,12 +88,12 @@ The API and Consumer depend on the abstractions in Core and wire the implementat
 
 ### Consumer
 
-- **Batching is the main throughput lever.** The RabbitMQ callback only copies the delivery into a bounded in-memory channel. One loop drains it into batches of up to **500** (or whatever has arrived after a **200 ms** window), writes the batch in **one stored-procedure call** using a table-valued parameter, then settles the whole batch with **one multiple-ack**. Prefetch is two batches (1,000), so the next batch fills while the current one is written.
+- **Batching is the main throughput lever.** The RabbitMQ callback only copies the delivery into a bounded in-memory channel. One loop drains it into batches of up to **500** (or whatever has arrived after a **200 ms** window), writes the batch in **one stored-procedure call** using a table-valued parameter, then acknowledges each delivery on its own tag. Prefetch is two batches (1,000), so the next batch fills while the current one is written.
 - **Ack after commit.** Messages are acknowledged only after the database transaction commits. A crash at any point causes redelivery, never loss (at-least-once delivery).
 - **Idempotent writes make redelivery safe.** `WagerId` is a unique key. The procedure de-duplicates within the batch and skips wagers already stored, so redelivered or duplicate messages are acknowledged without being stored or totalled twice.
 - **Poison messages are dead-lettered.**
-  - A malformed message, or one that breaks database invariants, goes to `ot.casino.wagers.dead` instead of being redelivered forever.
-  - If SQL Server rejects a whole batch with a non-transient error, the processor writes each message individually. The one bad row is dead-lettered and the other 499 are stored.
+  - A malformed message, or one that breaks database invariants, is published by the consumer to `ot.casino.wagers.dead` with an `ot-dead-letter-reason` header saying why. The original delivery is acked only after the broker confirms that publish, so a failed dead-letter publish means redelivery, not loss. The main queue also keeps its `x-dead-letter-exchange` argument as a safety net: anything rejected without requeue lands in the same queue instead of being dropped.
+  - If SQL Server rejects a whole batch with a non-transient error, the processor writes each message individually. The one bad row is dead-lettered and the other 499 are stored. A row that cannot be joined is not inserted and is not added to the player total; the procedure fails the batch so that row is isolated.
 - **Transient errors are retried.** Deadlocks, timeouts and failover errors are retried with exponential backoff and jitter (Polly). If the database stays down, the batch is negatively acknowledged back to the queue and the consumer pauses for 5 seconds rather than spinning.
 - **Testable core.** The settlement rules live in `CasinoWagerBatchProcessor`, which has no RabbitMQ dependency. The worker only translates its result into ack/nack calls.
 
@@ -107,7 +107,7 @@ The API and Consumer depend on the abstractions in Core and wire the implementat
 - **`sessionData` is not stored.** The brief says not all data is required, and no endpoint uses it. It still travels on the queue, which carries the complete event, so a future consumer can use it.
 - **Clustered key is a `BIGINT IDENTITY`, not the GUID.** Random GUIDs as a clustered key cause page splits and fragmentation under insert load. `WagerId` is a separate unique non-clustered key.
 - **Covering index `IX_CasinoWager_PlayerId_CreatedDateTime (PlayerId, CreatedDateTime DESC, CasinoWagerId DESC) INCLUDE (WagerId, GameId, Amount)`.** The paged query is an index seek already in "latest first" order, with no sort and no key lookups.
-- **Running totals for top spenders and page counts.** `Player.TotalAmountSpent` and `TotalWagerCount` are updated **in the same transaction** as the wager insert, so they cannot drift. Top spenders becomes an ordered scan of `IX_Player_TotalAmountSpent` instead of a `SUM … GROUP BY` over every wager, and the page total is a single-row read instead of a `COUNT(*)`. This is the one deliberate denormalisation. I considered an indexed view (`SUM`/`COUNT_BIG` per player): it is maintained automatically, but it is stricter about session settings and adds hidden write cost. I preferred explicit, visible logic in the procedure.
+- **Running totals for top spenders and page counts.** `Player.TotalAmountSpent` and `TotalWagerCount` are updated **in the same transaction** from the rows the insert actually wrote, so they cannot drift from `dbo.CasinoWager`. Top spenders becomes an ordered scan of `IX_Player_TotalAmountSpent` instead of a `SUM … GROUP BY` over every wager, and the page total is a single-row read instead of a `COUNT(*)`. This is the one deliberate denormalisation. I considered an indexed view (`SUM`/`COUNT_BIG` per player): it is maintained automatically, but it is stricter about session settings and adds hidden write cost. I preferred explicit, visible logic in the procedure.
 - **`READ_COMMITTED_SNAPSHOT` is on.** The GET endpoints read the last committed version and are never blocked by an open batch transaction. This is what keeps the GETs fast during the load test.
 - **Types.**
   - `DECIMAL(19,4)` for money (rounded away from zero to four places).
@@ -149,15 +149,16 @@ Measured in a 2-vCPU Linux container with SQL Server 2022 and RabbitMQ 3 in Dock
 
 ## 6. Tests
 
-`dotnet test` runs 50 tests:
+`dotnet test` runs 55 tests:
 
 - **Consumer:**
   - batch window and size behaviour;
   - settlement rules: dead-lettering, isolating a rejected row, transient retry, requeue after retries are exhausted, duplicates;
+  - per-tag ack and requeue, including a batch whose tags are not a contiguous prefix, and a poison message that is not acked when the dead-letter publish fails;
   - message invariants.
 - **API (real ASP.NET Core pipeline via `WebApplicationFactory`, bus and database substituted):**
   - the brief's sample on the Tester's exact route and casing (`/api/Player/CasinoWager`, `"Username"`, `"Duration"`) returns `200`;
-  - validation failures return `400`;
+  - validation failures return `400`, including an empty `wagerId` or `accountId`;
   - bus outage returns `503`;
   - response shapes match the brief;
   - paging bounds are enforced.
@@ -182,7 +183,7 @@ CI (GitHub Actions) builds and runs the test suite on every push.
 
 - **Telling loss apart from duplicates.** The first load test stored 6,969 of 7,000. Before assuming lost messages, I checked every hop: all 7,000 requests got `200`, the queue was empty, nothing was dead-lettered, and the consumer had acknowledged 7,000 deliveries, 31 of them as "already stored". That pointed at the input, and the NBomber probe confirmed it. Logging duplicates per batch is what made this visible, so it stays in.
 - **Cold-start latency.** I assumed the cold p95 was the RabbitMQ connection and added a start-up warm-up for the channel pool. Re-measuring showed the warm-up is worthwhile but was not the main factor: on this 2-core machine the cold cost is mostly JIT compilation and the Tester's per-request TLS. The notes say so rather than over-claiming.
-- **Multiple-ack correctness.** One `BasicAck(multiple: true)` per batch is efficient but must not settle a message by accident. Dead-letter nacks are sent first. The batch is always a contiguous prefix of the delivery tags, so nothing still in the buffer is ever acknowledged before it is written.
+- **Acknowledging one tag at a time.** The first version settled each batch with one `BasicAck(multiple: true)`. That is correct here: there is one channel and the buffer keeps delivery order, so a batch is always a contiguous run of tags, and a redelivered message comes back with a new, higher tag. But a multiple-ack settles *every* outstanding tag up to the one given, so it is only safe while that invariant holds, for example it would break if batches were ever processed in parallel. Each delivery is now acked or requeued on its own tag. Measured cost: total database-and-ack time for a 7,000-message backlog went from about 1.0 s to 1.6 s; the backlog still drained in 2.5 s.
 
 ---
 
