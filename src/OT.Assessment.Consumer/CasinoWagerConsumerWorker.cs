@@ -12,10 +12,11 @@ namespace OT.Assessment.Consumer;
 /// Consumes wager messages and stores them in batches.
 /// <para>
 /// The RabbitMQ callback only copies each delivery into an in-memory buffer; a single loop drains
-/// the buffer in batches, writes each batch in one stored procedure call and then acknowledges the
-/// whole batch with one multiple-ack. Messages are acknowledged only after the database commit, so a
-/// crash at any point leads to redelivery, never loss; the stored procedure ignores wagers it has
-/// already stored, so redelivery never double-counts.
+/// the buffer in batches, writes each batch in one stored procedure call and then acknowledges each
+/// delivery on its own tag. Messages are acknowledged only after the database commit, so a crash at
+/// any point leads to redelivery, never loss; the stored procedure ignores wagers it has already
+/// stored, so redelivery never double-counts. A poison message is published to the dead-letter
+/// queue and acked only after the broker confirms that publish.
 /// </para>
 /// </summary>
 internal sealed class CasinoWagerConsumerWorker : BackgroundService
@@ -24,6 +25,7 @@ internal sealed class CasinoWagerConsumerWorker : BackgroundService
 
     private readonly RabbitMqConnectionProvider _connectionProvider;
     private readonly CasinoWagerBatchProcessor _processor;
+    private readonly DeliverySettler _settler;
     private readonly RabbitMqOptions _rabbit;
     private readonly ConsumerOptions _options;
     private readonly ILogger<CasinoWagerConsumerWorker> _logger;
@@ -32,12 +34,14 @@ internal sealed class CasinoWagerConsumerWorker : BackgroundService
     public CasinoWagerConsumerWorker(
         RabbitMqConnectionProvider connectionProvider,
         CasinoWagerBatchProcessor processor,
+        DeliverySettler settler,
         IOptions<RabbitMqOptions> rabbit,
         IOptions<ConsumerOptions> options,
         ILogger<CasinoWagerConsumerWorker> logger)
     {
         _connectionProvider = connectionProvider;
         _processor = processor;
+        _settler = settler;
         _rabbit = rabbit.Value;
         _options = options.Value;
         _logger = logger;
@@ -97,11 +101,11 @@ internal sealed class CasinoWagerConsumerWorker : BackgroundService
         while (true)
         {
             var batch = await BatchReader.ReadBatchAsync(buffer.Reader, _options.BatchSize, _options.BatchWindow, stoppingToken);
-            await HandleBatchAsync(channel, batch, stoppingToken);
+            await HandleBatchAsync(new ChannelDeliveryAcker(channel), batch, stoppingToken);
         }
     }
 
-    private async Task HandleBatchAsync(IChannel channel, List<InboundMessage> batch, CancellationToken stoppingToken)
+    private async Task HandleBatchAsync(IDeliveryAcker acker, List<InboundMessage> batch, CancellationToken stoppingToken)
     {
         var stopwatch = Stopwatch.StartNew();
         BatchResult result;
@@ -114,21 +118,12 @@ internal sealed class CasinoWagerConsumerWorker : BackgroundService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Batch of {Count} wagers could not be stored; requeueing", batch.Count);
-            await channel.BasicNackAsync(batch[^1].DeliveryTag, multiple: true, requeue: true, CancellationToken.None);
+            await _settler.RequeueAsync(batch, acker, CancellationToken.None);
             await Task.Delay(_options.RequeueDelayMilliseconds, stoppingToken);
             return;
         }
 
-        // Dead-letter first: the multiple-ack below settles every outstanding tag up to the highest one.
-        foreach (var tag in result.DeadLettered)
-        {
-            await channel.BasicNackAsync(tag, multiple: false, requeue: false, CancellationToken.None);
-        }
-
-        if (result.Acknowledged.Count > 0)
-        {
-            await channel.BasicAckAsync(result.Acknowledged.Max(), multiple: true, CancellationToken.None);
-        }
+        await _settler.SettleAsync(batch, result, acker, CancellationToken.None);
 
         _totalInserted += result.Inserted;
         _logger.LogInformation(

@@ -1,6 +1,8 @@
 using OT.Assessment.Consumer;
 using OT.Assessment.Consumer.Processing;
+using OT.Assessment.Core.Abstractions;
 using OT.Assessment.Infrastructure;
+using OT.Assessment.Infrastructure.Messaging;
 
 var builder = Host.CreateApplicationBuilder(new HostApplicationBuilderSettings
 {
@@ -18,7 +20,10 @@ builder.Services.AddOptions<ConsumerOptions>()
     .Validate(o => o.IsValid(), "Consumer settings are invalid: PrefetchCount must be at least BatchSize and at most 65535.")
     .ValidateOnStart();
 
+builder.Services.AddSingleton<RabbitMqDeadLetterPublisher>();
+builder.Services.AddSingleton<IDeadLetterPublisher>(sp => sp.GetRequiredService<RabbitMqDeadLetterPublisher>());
 builder.Services.AddSingleton<CasinoWagerBatchProcessor>();
+builder.Services.AddSingleton<DeliverySettler>();
 builder.Services.AddHostedService<CasinoWagerConsumerWorker>();
 
 var host = builder.Build();

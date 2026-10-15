@@ -19,6 +19,10 @@ public static class RabbitMqTopology
 
         await channel.ExchangeDeclareAsync(options.Exchange, ExchangeType.Direct, durable: true,
             autoDelete: false, cancellationToken: cancellationToken);
+        // Keep the dead-letter argument. RabbitMQ refuses to redeclare a queue whose arguments
+        // differ, and the publisher turns that failure into HTTP 503. The consumer does not use
+        // this argument: it publishes the poison message itself and acks the original only after
+        // the broker confirms. The argument still covers a nack or expiry, which would otherwise drop.
         await channel.QueueDeclareAsync(options.Queue, durable: true, exclusive: false, autoDelete: false,
             arguments: new Dictionary<string, object>
             {

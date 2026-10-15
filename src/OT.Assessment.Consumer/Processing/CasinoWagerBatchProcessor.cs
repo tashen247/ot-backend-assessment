@@ -57,13 +57,13 @@ internal sealed class CasinoWagerBatchProcessor
 
         foreach (var delivery in batch)
         {
-            if (TryParse(delivery, out var wager))
+            if (TryParse(delivery, out var wager, out var reason))
             {
                 valid.Add((delivery.DeliveryTag, wager));
             }
             else
             {
-                result.DeadLettered.Add(delivery.DeliveryTag);
+                result.DeadLetter(delivery.DeliveryTag, reason);
             }
         }
 
@@ -98,7 +98,7 @@ internal sealed class CasinoWagerBatchProcessor
             catch (Exception ex) when (!SqlTransientErrors.IsTransient(ex) && ex is not OperationCanceledException)
             {
                 _logger.LogError(ex, "Wager {WagerId} was rejected by the database and has been dead-lettered", wager.WagerId);
-                result.DeadLettered.Add(tag);
+                result.DeadLetter(tag, "rejected by the database");
             }
         }
     }
@@ -109,7 +109,7 @@ internal sealed class CasinoWagerBatchProcessor
             (Writer: _writer, Wagers: wagers),
             cancellationToken).AsTask();
 
-    private bool TryParse(InboundMessage delivery, out CasinoWagerMessage wager)
+    private bool TryParse(InboundMessage delivery, out CasinoWagerMessage wager, out string reason)
     {
         try
         {
@@ -119,10 +119,11 @@ internal sealed class CasinoWagerBatchProcessor
         {
             _logger.LogError(ex, "Delivery {DeliveryTag} is not a valid wager message and has been dead-lettered", delivery.DeliveryTag);
             wager = null;
+            reason = "malformed message";
             return false;
         }
 
-        if (CasinoWagerMessageRules.IsValid(wager, out var reason))
+        if (CasinoWagerMessageRules.IsValid(wager, out reason))
         {
             return true;
         }
