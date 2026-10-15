@@ -47,6 +47,8 @@ public class PlayerControllerTests : IClassFixture<ApiFactory>
     [InlineData("amount", "-5")]
     [InlineData("countryCode", "\"ZAF\"")]
     [InlineData("numberOfBets", "0")]
+    [InlineData("wagerId", "\"00000000-0000-0000-0000-000000000000\"")]
+    [InlineData("accountId", "\"00000000-0000-0000-0000-000000000000\"")]
     public async Task Post_rejects_invalid_wagers_with_400_and_publishes_nothing(string field, string value)
     {
         var body = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(TestData.BriefSampleJson)!;

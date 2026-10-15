@@ -9,7 +9,7 @@ namespace OT.Assessment.App.Contracts;
 /// </summary>
 public sealed class CasinoWagerRequest
 {
-    [Required] public Guid? WagerId { get; set; }
+    [Required, NotEmptyGuid] public Guid? WagerId { get; set; }
 
     [StringLength(50)] public string Theme { get; set; }
 
@@ -21,7 +21,7 @@ public sealed class CasinoWagerRequest
 
     [Required] public Guid? BrandId { get; set; }
 
-    [Required] public Guid? AccountId { get; set; }
+    [Required, NotEmptyGuid] public Guid? AccountId { get; set; }
 
     [Required, StringLength(100)] public string Username { get; set; }
 
