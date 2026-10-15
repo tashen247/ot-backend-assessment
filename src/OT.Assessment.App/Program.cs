@@ -1,11 +1,22 @@
 using System.Reflection;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
+using OT.Assessment.App.ErrorHandling;
+using OT.Assessment.Infrastructure;
 
 var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddControllers();
 
-// Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckl
+builder.Services.AddControllers();
+builder.Services.AddProblemDetails();
+builder.Services.AddExceptionHandler<MessagePublishExceptionHandler>();
+
+builder.Services
+    .AddSqlServerPersistence(builder.Configuration)
+    .AddRabbitMq(builder.Configuration)
+    .AddRabbitMqPublisher();
+
+builder.Services.AddHealthChecks().AddInfrastructureHealthChecks();
+
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
 builder.Services.AddSwaggerGen(options =>
 {
     var xmlFilename = $"{Assembly.GetExecutingAssembly().GetName().Name}.xml";
@@ -14,7 +25,8 @@ builder.Services.AddSwaggerGen(options =>
 
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
+app.UseExceptionHandler();
+
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
@@ -32,4 +44,11 @@ app.UseAuthorization();
 
 app.MapControllers();
 
+// Liveness: the process is up. Readiness: SQL Server and RabbitMQ are reachable.
+app.MapHealthChecks("/health/live", new HealthCheckOptions { Predicate = _ => false });
+app.MapHealthChecks("/health/ready", new HealthCheckOptions { Predicate = r => r.Tags.Contains(ServiceCollectionExtensions.ReadyTag) });
+
 app.Run();
+
+/// <summary>Exposed for integration testing with WebApplicationFactory.</summary>
+public partial class Program;
