@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
 		<OutputType>Exe</OutputType>
@@ -7,14 +7,14 @@
 		<Nullable>disable</Nullable>
 	</PropertyGroup>
 
-
 	<ItemGroup>
-		<PackageReference Include="Microsoft.Extensions.Configuration" Version="8.0.0" />
-		<PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
-		<PackageReference Include="Microsoft.Extensions.Http" Version="8.0.0" />
-		<PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.0" />
+		<PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+		<PackageReference Include="Polly.Core" Version="8.4.2" />
 	</ItemGroup>
 
+	<ItemGroup>
+		<ProjectReference Include="..\OT.Assessment.Infrastructure\OT.Assessment.Infrastructure.csproj" />
+	</ItemGroup>
 
 	<ItemGroup>
 		<None Update="appsettings.json">
@@ -22,5 +22,8 @@
 		</None>
 	</ItemGroup>
 
+	<ItemGroup>
+		<InternalsVisibleTo Include="OT.Assessment.UnitTests" />
+	</ItemGroup>
 
 </Project>
