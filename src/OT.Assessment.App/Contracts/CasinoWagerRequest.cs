@@ -29,8 +29,11 @@ public sealed class CasinoWagerRequest
 
     [Required] public Guid? TransactionTypeId { get; set; }
 
-    /// <summary>Wager amount. Stored to four decimal places.</summary>
-    [Required, Range(0d, 1_000_000_000_000d)] public double? Amount { get; set; }
+    /// <summary>
+    /// Wager amount. Bound straight from the JSON number to decimal so money never passes
+    /// through binary floating point. Stored to four decimal places.
+    /// </summary>
+    [Required, Range(typeof(decimal), "0", "1000000000000")] public decimal? Amount { get; set; }
 
     [Required] public DateTimeOffset? CreatedDateTime { get; set; }
 
@@ -57,7 +60,7 @@ public sealed class CasinoWagerRequest
         Username = Username,
         ExternalReferenceId = ExternalReferenceId!.Value,
         TransactionTypeId = TransactionTypeId!.Value,
-        Amount = (decimal)Amount!.Value,
+        Amount = Amount!.Value,
         CreatedDateTime = CreatedDateTime!.Value,
         NumberOfBets = NumberOfBets!.Value,
         CountryCode = CountryCode.ToUpperInvariant(),
