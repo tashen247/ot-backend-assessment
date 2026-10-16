@@ -41,5 +41,5 @@ public class CircuitBreakerSettingsTests
     [InlineData(0.2, 1)]
     [InlineData(14.01, 15)]
     public void Retry_after_is_whole_seconds_rounded_up_and_at_least_one(double? seconds, int expected) =>
-        Assert.Equal(expected, MessagePublishExceptionHandler.RetryAfterSeconds(seconds is { } s ? TimeSpan.FromSeconds(s) : null));
+        Assert.Equal(expected, MessageBusUnavailable.RetryAfterSeconds(seconds is { } s ? TimeSpan.FromSeconds(s) : null));
 }

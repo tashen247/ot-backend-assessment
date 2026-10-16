@@ -1,6 +1,7 @@
 using System.ComponentModel.DataAnnotations;
 using Microsoft.AspNetCore.Mvc;
 using OT.Assessment.App.Contracts;
+using OT.Assessment.App.ErrorHandling;
 using OT.Assessment.Core.Abstractions;
 using OT.Assessment.Core.Models;
 
@@ -17,11 +18,13 @@ public sealed class PlayerController : ControllerBase
 
     private readonly ICasinoWagerPublisher _publisher;
     private readonly IPlayerReadRepository _players;
+    private readonly ILogger<PlayerController> _logger;
 
-    public PlayerController(ICasinoWagerPublisher publisher, IPlayerReadRepository players)
+    public PlayerController(ICasinoWagerPublisher publisher, IPlayerReadRepository players, ILogger<PlayerController> logger)
     {
         _publisher = publisher;
         _players = players;
+        _logger = logger;
     }
 
     /// <summary>Accepts a casino wager event and publishes it to the message bus for storage.</summary>
@@ -38,7 +41,15 @@ public sealed class PlayerController : ControllerBase
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status503ServiceUnavailable)]
     public async Task<IActionResult> PostCasinoWager([FromBody] CasinoWagerRequest request, CancellationToken cancellationToken)
     {
-        await _publisher.PublishAsync(request.ToMessage(), cancellationToken);
+        try
+        {
+            await _publisher.PublishAsync(request.ToMessage(), cancellationToken);
+        }
+        catch (MessagePublishException ex)
+        {
+            return MessageBusUnavailable.Result(HttpContext, ex, _logger);
+        }
+
         return Ok();
     }
 

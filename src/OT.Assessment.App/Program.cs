@@ -1,13 +1,11 @@
 using System.Reflection;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
-using OT.Assessment.App.ErrorHandling;
 using OT.Assessment.Infrastructure;
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddControllers();
 builder.Services.AddProblemDetails();
-builder.Services.AddExceptionHandler<MessagePublishExceptionHandler>();
 
 builder.Services
     .AddSqlServerPersistence(builder.Configuration)
