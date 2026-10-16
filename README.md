@@ -82,5 +82,6 @@ dotnet test
 
 ## Further reading
 
+- [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md): a step-by-step walkthrough of a wager through the API, RabbitMQ, the consumer and SQL Server, with the RabbitMQ and Docker concepts explained.
 - [Notes.md](Notes.md): design decisions, measured results, findings in the boilerplate, challenges, and what I would add for production.
 - [docs/ASSESSMENT.md](docs/ASSESSMENT.md): the original assessment brief.
