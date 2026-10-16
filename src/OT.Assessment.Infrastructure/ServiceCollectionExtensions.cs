@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using OT.Assessment.Core.Abstractions;
 using OT.Assessment.Infrastructure.HealthChecks;
 using OT.Assessment.Infrastructure.Messaging;
@@ -29,10 +30,13 @@ public static class ServiceCollectionExtensions
     {
         services.AddOptions<RabbitMqOptions>()
             .Bind(configuration.GetSection(RabbitMqOptions.SectionName))
-            .Validate(o => !string.IsNullOrWhiteSpace(o.HostName) && !string.IsNullOrWhiteSpace(o.Queue),
-                "RabbitMq:HostName and RabbitMq:Queue are required.")
+            .Validate(o => o.IsValid(),
+                "RabbitMq settings are invalid: HostName and Queue are required, PublisherChannelPoolSize and " +
+                "PublishTimeoutMilliseconds must be positive, and PublishCircuitBreaker needs a FailureRatio in (0, 1], " +
+                "MinimumThroughput of at least 2 and durations of at least 1 second.")
             .ValidateOnStart();
 
+        services.TryAddSingleton(TimeProvider.System);
         services.AddSingleton<RabbitMqConnectionProvider>();
         return services;
     }
@@ -51,4 +55,8 @@ public static class ServiceCollectionExtensions
         builder
             .AddCheck<SqlServerHealthCheck>("sqlserver", tags: [ReadyTag])
             .AddCheck<RabbitMqHealthCheck>("rabbitmq", tags: [ReadyTag]);
+
+    /// <summary>Adds a readiness check that reports Degraded while the API is refusing wagers because the publish circuit is open.</summary>
+    public static IHealthChecksBuilder AddRabbitMqPublisherHealthCheck(this IHealthChecksBuilder builder) =>
+        builder.AddCheck<RabbitMqPublishCircuitHealthCheck>("rabbitmq-publish-circuit", tags: [ReadyTag]);
 }

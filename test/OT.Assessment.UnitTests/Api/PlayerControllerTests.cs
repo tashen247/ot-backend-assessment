@@ -81,6 +81,18 @@ public class PlayerControllerTests : IClassFixture<ApiFactory>
     }
 
     [Fact]
+    public async Task Post_tells_the_caller_how_long_to_wait_while_the_publish_circuit_is_open()
+    {
+        _factory.Publisher.PublishAsync(default, default)
+            .ThrowsAsyncForAnyArgs(new MessagePublishException("circuit open", new Exception(), TimeSpan.FromSeconds(12.3)));
+
+        var response = await _client.PostAsync("/api/player/casinowager", Json(TestData.BriefSampleJson));
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        Assert.Equal(TimeSpan.FromSeconds(13), response.Headers.RetryAfter?.Delta);
+    }
+
+    [Fact]
     public async Task Get_casino_returns_the_paged_shape_from_the_brief()
     {
         var accountId = Guid.NewGuid();

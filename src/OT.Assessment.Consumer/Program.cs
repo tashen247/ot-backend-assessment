@@ -17,7 +17,7 @@ builder.Services
 
 builder.Services.AddOptions<ConsumerOptions>()
     .Bind(builder.Configuration.GetSection(ConsumerOptions.SectionName))
-    .Validate(o => o.IsValid(), "Consumer settings are invalid: PrefetchCount must be at least BatchSize and at most 65535.")
+    .Validate(o => o.IsValid(), "Consumer settings are invalid: PrefetchCount must be at least BatchSize and at most 65535, and CircuitBreaker needs a FailureRatio in (0, 1], MinimumThroughput of at least 2 and durations of at least 1 second.")
     .ValidateOnStart();
 
 builder.Services.AddSingleton<RabbitMqDeadLetterPublisher>();

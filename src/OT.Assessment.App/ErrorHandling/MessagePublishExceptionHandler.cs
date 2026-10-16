@@ -1,3 +1,4 @@
+using System.Globalization;
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
 using OT.Assessment.Core.Abstractions;
@@ -16,15 +17,23 @@ internal sealed class MessagePublishExceptionHandler : IExceptionHandler
 
     public async ValueTask<bool> TryHandleAsync(HttpContext httpContext, Exception exception, CancellationToken cancellationToken)
     {
-        if (exception is not MessagePublishException)
+        if (exception is not MessagePublishException publishException)
         {
             return false;
         }
 
-        _logger.LogError(exception, "Failed to publish casino wager");
+        if (publishException.RetryAfter is null)
+        {
+            _logger.LogError(exception, "Failed to publish casino wager");
+        }
+        else
+        {
+            // The circuit is open: one warning when it opened is enough, not an error per request.
+            _logger.LogDebug("Casino wager refused while the publish circuit is open");
+        }
 
         httpContext.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
-        httpContext.Response.Headers.RetryAfter = "5";
+        httpContext.Response.Headers.RetryAfter = RetryAfterSeconds(publishException.RetryAfter).ToString(CultureInfo.InvariantCulture);
         await httpContext.Response.WriteAsJsonAsync(new ProblemDetails
         {
             Status = StatusCodes.Status503ServiceUnavailable,
@@ -35,4 +44,10 @@ internal sealed class MessagePublishExceptionHandler : IExceptionHandler
 
         return true;
     }
+
+    private const int DefaultRetryAfterSeconds = 5;
+
+    /// <summary>Whole seconds, rounded up and at least 1, as Retry-After requires.</summary>
+    internal static int RetryAfterSeconds(TimeSpan? retryAfter) =>
+        retryAfter is { } wait ? Math.Max(1, (int)Math.Ceiling(wait.TotalSeconds)) : DefaultRetryAfterSeconds;
 }

@@ -1,3 +1,5 @@
+using OT.Assessment.Infrastructure.Resilience;
+
 namespace OT.Assessment.Consumer;
 
 public sealed class ConsumerOptions
@@ -21,12 +23,29 @@ public sealed class ConsumerOptions
 
     public int RetryBaseDelayMilliseconds { get; set; } = 200;
 
-    /// <summary>Pause before resuming after a batch had to be requeued, so a database outage does not become a hot loop.</summary>
+    /// <summary>
+    /// Pause before trying again after a batch could not be stored, so a database outage does not
+    /// become a hot loop. While the circuit is open the wait is the time left on the break instead.
+    /// </summary>
     public int RequeueDelayMilliseconds { get; set; } = 5000;
+
+    /// <summary>
+    /// Opens after SQL Server has failed with transient errors (outlasting the retries) for every
+    /// batch in the window. While open, the consumer holds its current batch unacknowledged and
+    /// stops reading new deliveries, instead of cycling messages through nack and requeue.
+    /// </summary>
+    public CircuitBreakerSettings CircuitBreaker { get; set; } = new()
+    {
+        FailureRatio = 1.0,
+        MinimumThroughput = 2,
+        SamplingDurationSeconds = 60,
+        BreakDurationSeconds = 30
+    };
 
     public TimeSpan BatchWindow => TimeSpan.FromMilliseconds(BatchWindowMilliseconds);
 
     public bool IsValid() =>
         BatchSize > 0 && BatchWindowMilliseconds > 0 && PrefetchCount >= BatchSize && PrefetchCount <= ushort.MaxValue
-        && MaxWriteRetries >= 0 && RetryBaseDelayMilliseconds >= 0 && RequeueDelayMilliseconds >= 0;
+        && MaxWriteRetries >= 0 && RetryBaseDelayMilliseconds >= 0 && RequeueDelayMilliseconds >= 0
+        && CircuitBreaker is not null && CircuitBreaker.IsValid();
 }

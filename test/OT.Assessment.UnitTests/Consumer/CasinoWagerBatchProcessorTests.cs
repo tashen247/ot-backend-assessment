@@ -93,7 +93,7 @@ public class CasinoWagerBatchProcessorTests
     }
 
     [Fact]
-    public async Task Throws_when_transient_failures_outlast_the_retries_so_the_batch_is_requeued()
+    public async Task Throws_when_transient_failures_outlast_the_retries_so_the_batch_is_held()
     {
         _writer.WriteBatchAsync(Arg.Any<IReadOnlyCollection<CasinoWagerMessage>>(), Arg.Any<CancellationToken>())
             .ThrowsAsync(new TimeoutException());

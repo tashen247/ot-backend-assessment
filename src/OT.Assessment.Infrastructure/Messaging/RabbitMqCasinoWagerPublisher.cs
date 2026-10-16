@@ -1,7 +1,11 @@
 using System.Threading.Channels;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OT.Assessment.Core.Abstractions;
 using OT.Assessment.Core.Messaging;
+using OT.Assessment.Infrastructure.Resilience;
+using Polly;
+using Polly.CircuitBreaker;
 using RabbitMQ.Client;
 using IAmqpChannel = RabbitMQ.Client.IChannel;
 
@@ -13,7 +17,13 @@ namespace OT.Assessment.Infrastructure.Messaging;
 /// <para>
 /// AMQP channels should not be shared across concurrent publishers, and opening one per request
 /// is expensive, so a fixed pool of channels is shared by all requests. A slot holds a channel
-/// that is created lazily and replaced if the broker closes it.
+/// that is created lazily and replaced if the broker closes it or a publish on it fails.
+/// </para>
+/// <para>
+/// Each publish is bounded by a timeout and runs behind a circuit breaker. When publishes keep
+/// failing, or the broker reports that it is blocking publishers, the circuit opens and requests
+/// are refused at once, before a channel is rented, instead of each one waiting to fail. The
+/// caller is told how long to wait before retrying.
 /// </para>
 /// </summary>
 public sealed class RabbitMqCasinoWagerPublisher : ICasinoWagerPublisher, IAsyncDisposable
@@ -23,15 +33,24 @@ public sealed class RabbitMqCasinoWagerPublisher : ICasinoWagerPublisher, IAsync
 
     private readonly RabbitMqConnectionProvider _connectionProvider;
     private readonly RabbitMqOptions _options;
+    private readonly ILogger<RabbitMqCasinoWagerPublisher> _logger;
     private readonly Channel<IAmqpChannel> _pool;
     private readonly int _poolSize;
     private readonly SemaphoreSlim _topologyLock = new(1, 1);
+    private readonly ResiliencePipeline _pipeline;
     private volatile bool _topologyDeclared;
+    private IConnection _watchedConnection;
 
-    public RabbitMqCasinoWagerPublisher(RabbitMqConnectionProvider connectionProvider, IOptions<RabbitMqOptions> options)
+    public RabbitMqCasinoWagerPublisher(
+        RabbitMqConnectionProvider connectionProvider,
+        IOptions<RabbitMqOptions> options,
+        ILogger<RabbitMqCasinoWagerPublisher> logger,
+        TimeProvider timeProvider = null)
     {
         _connectionProvider = connectionProvider;
         _options = options.Value;
+        _logger = logger;
+        var time = timeProvider ?? TimeProvider.System;
 
         _poolSize = Math.Max(1, _options.PublisherChannelPoolSize);
         _pool = Channel.CreateBounded<IAmqpChannel>(_poolSize);
@@ -39,42 +58,91 @@ public sealed class RabbitMqCasinoWagerPublisher : ICasinoWagerPublisher, IAsync
         {
             _pool.Writer.TryWrite(null); // empty slot, filled on first use
         }
+
+        Circuit = new CircuitBreakerTracker("RabbitMQ publish", _options.PublishCircuitBreaker, logger, time);
+
+        // The breaker is outermost so that a publish that times out counts as one failure.
+        // Caller cancellation (the HTTP request went away) says nothing about the broker and is not counted.
+        _pipeline = new ResiliencePipelineBuilder { TimeProvider = time }
+            .AddCircuitBreaker(Circuit.CreateOptions(ex => ex is not OperationCanceledException))
+            .AddTimeout(_options.PublishTimeout)
+            .Build();
     }
+
+    /// <summary>State of the publish circuit breaker, for health reporting.</summary>
+    public CircuitBreakerTracker Circuit { get; }
 
     public async Task PublishAsync(CasinoWagerMessage message, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(message);
 
-        var channel = await _pool.Reader.ReadAsync(cancellationToken);
+        // Fail fast without touching the pool: an open circuit must not hold up the channels.
+        if (Circuit.IsOpen)
+        {
+            throw Unavailable(message, null);
+        }
+
+        var lease = new ChannelLease { Channel = await _pool.Reader.ReadAsync(cancellationToken) };
         try
         {
-            if (channel is null || channel.IsClosed)
+            await _pipeline.ExecuteAsync(
+                static (state, token) => state.Self.PublishOnAsync(state.Lease, state.Message, token),
+                (Self: this, Lease: lease, Message: message),
+                cancellationToken);
+        }
+        catch (BrokenCircuitException ex)
+        {
+            // Rejected before the channel was used, so it goes back to the pool as it is.
+            throw Unavailable(message, ex);
+        }
+        catch (Exception ex)
+        {
+            // A publish that failed or was abandoned part-way may leave the channel waiting on a
+            // confirm that will never be read, so the slot is emptied rather than reused.
+            DiscardChannel(lease);
+
+            if (ex is OperationCanceledException)
             {
-                channel?.Dispose();
-                channel = null; // if opening fails, the slot goes back empty rather than holding a dead channel
-                channel = await OpenChannelAsync(cancellationToken);
+                throw;
             }
 
-            var properties = new BasicProperties
-            {
-                Persistent = true,
-                ContentType = "application/json",
-                MessageId = message.WagerId.ToString(),
-                Type = nameof(CasinoWagerMessage),
-                Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds())
-            };
-
-            await channel.BasicPublishAsync(_options.Exchange, _options.RoutingKey, mandatory: true,
-                properties, MessageSerializer.Serialize(message), cancellationToken);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
             throw new MessagePublishException($"Wager {message.WagerId} could not be published to RabbitMQ.", ex);
         }
         finally
         {
-            _pool.Writer.TryWrite(channel);
+            _pool.Writer.TryWrite(lease.Channel);
         }
+    }
+
+    private async ValueTask PublishOnAsync(ChannelLease lease, CasinoWagerMessage message, CancellationToken cancellationToken)
+    {
+        if (lease.Channel is null || lease.Channel.IsClosed)
+        {
+            DiscardChannel(lease); // if opening fails, the slot goes back empty rather than holding a dead channel
+            lease.Channel = await OpenChannelAsync(cancellationToken);
+        }
+
+        var properties = new BasicProperties
+        {
+            Persistent = true,
+            ContentType = "application/json",
+            MessageId = message.WagerId.ToString(),
+            Type = nameof(CasinoWagerMessage),
+            Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+        };
+
+        await lease.Channel.BasicPublishAsync(_options.Exchange, _options.RoutingKey, mandatory: true,
+            properties, MessageSerializer.Serialize(message), cancellationToken);
+    }
+
+    private MessagePublishException Unavailable(CasinoWagerMessage message, Exception inner) =>
+        new($"Wager {message.WagerId} was not published: RabbitMQ is unavailable (publish circuit {Circuit.State}).",
+            inner ?? new BrokenCircuitException(), Circuit.RetryAfter);
+
+    private static void DiscardChannel(ChannelLease lease)
+    {
+        lease.Channel?.Dispose();
+        lease.Channel = null;
     }
 
     /// <summary>
@@ -111,6 +179,8 @@ public sealed class RabbitMqCasinoWagerPublisher : ICasinoWagerPublisher, IAsync
     private async Task<IAmqpChannel> OpenChannelAsync(CancellationToken cancellationToken)
     {
         var connection = await _connectionProvider.GetConnectionAsync(cancellationToken);
+        WatchForBlocking(connection);
+
         var channel = await connection.CreateChannelAsync(ConfirmedChannel, cancellationToken);
 
         if (_topologyDeclared)
@@ -140,6 +210,31 @@ public sealed class RabbitMqCasinoWagerPublisher : ICasinoWagerPublisher, IAsync
         }
     }
 
+    /// <summary>
+    /// Under a memory or disk alarm the broker keeps the connection open but stops reading from
+    /// publishers, and says so. Opening the circuit on that signal refuses wagers immediately instead
+    /// of letting requests time out one by one; it closes again when the broker unblocks.
+    /// </summary>
+    private void WatchForBlocking(IConnection connection)
+    {
+        if (Interlocked.CompareExchange(ref _watchedConnection, connection, null) is not null)
+        {
+            return;
+        }
+
+        connection.ConnectionBlockedAsync += async (_, args) =>
+        {
+            _logger.LogWarning("RabbitMQ is blocking publishers: {Reason}", args.Reason);
+            await Circuit.ManualControl.IsolateAsync();
+        };
+
+        connection.ConnectionUnblockedAsync += async (_, _) =>
+        {
+            _logger.LogInformation("RabbitMQ has stopped blocking publishers");
+            await Circuit.ManualControl.CloseAsync();
+        };
+    }
+
     public async ValueTask DisposeAsync()
     {
         _pool.Writer.TryComplete();
@@ -153,5 +248,11 @@ public sealed class RabbitMqCasinoWagerPublisher : ICasinoWagerPublisher, IAsync
         }
 
         _topologyLock.Dispose();
+    }
+
+    /// <summary>The channel rented for one publish; replaced in place if it has to be reopened.</summary>
+    private sealed class ChannelLease
+    {
+        public IAmqpChannel Channel { get; set; }
     }
 }

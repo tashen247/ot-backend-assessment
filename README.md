@@ -14,8 +14,8 @@ A .NET 8 solution that captures casino wager events at load, stores them in SQL 
 - **A 200 means the wager is durable.** The API returns only after RabbitMQ confirms the message is persisted.
 - **Batched writes.** The consumer stores up to 500 wagers per stored-procedure call using a table-valued parameter, and acknowledges messages only after the transaction commits.
 - **Idempotent on `WagerId`.** Redelivered or duplicate messages are never stored or totalled twice.
-- **Nothing is silently lost.** Bad messages go to a dead-letter queue with the reason recorded; database and broker outages are retried and requeued, not dropped.
-- Circuit breakers on both sides. If RabbitMQ is down or blocking, the API stops trying and answers 503 at once with a Retry-After. If SQL Server is down, the consumer holds its batch unacknowledged and stops pulling more until the database recovers.
+- **Nothing is silently lost.** Bad messages go to a dead-letter queue with the reason recorded; database and broker outages are retried and held, not dropped.
+- **Circuit breakers on both sides.** If RabbitMQ is down or blocking, the API stops trying and answers `503` at once with a `Retry-After`. If SQL Server is down, the consumer holds its batch unacknowledged and stops pulling more until the database recovers.
 - **Reads never wait for writes.** Read committed snapshot keeps both GET endpoints fast during load.
 
 ## Results against the provided Tester

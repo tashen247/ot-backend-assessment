@@ -14,7 +14,9 @@ builder.Services
     .AddRabbitMq(builder.Configuration)
     .AddRabbitMqPublisher();
 
-builder.Services.AddHealthChecks().AddInfrastructureHealthChecks();
+builder.Services.AddHealthChecks()
+    .AddInfrastructureHealthChecks()
+    .AddRabbitMqPublisherHealthCheck();
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(options =>

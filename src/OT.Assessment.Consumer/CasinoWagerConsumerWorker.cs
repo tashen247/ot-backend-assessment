@@ -3,6 +3,7 @@ using System.Threading.Channels;
 using Microsoft.Extensions.Options;
 using OT.Assessment.Consumer.Processing;
 using OT.Assessment.Infrastructure.Messaging;
+using Polly.CircuitBreaker;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 
@@ -18,10 +19,17 @@ namespace OT.Assessment.Consumer;
 /// stored, so redelivery never double-counts. A poison message is published to the dead-letter
 /// queue and acked only after the broker confirms that publish.
 /// </para>
+/// <para>
+/// When SQL Server is unavailable the batch is held, unacknowledged, and written again once the
+/// database recovers. Nothing new is read meanwhile: the prefetch limit means the broker stops
+/// delivering, so the rest of the backlog waits safely in the queue rather than cycling through
+/// nack and requeue. A circuit breaker decides how long to wait between attempts.
+/// </para>
 /// </summary>
 internal sealed class CasinoWagerConsumerWorker : BackgroundService
 {
     private static readonly TimeSpan RestartDelay = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan MinimumHold = TimeSpan.FromMilliseconds(100);
 
     private readonly RabbitMqConnectionProvider _connectionProvider;
     private readonly CasinoWagerBatchProcessor _processor;
@@ -101,26 +109,37 @@ internal sealed class CasinoWagerConsumerWorker : BackgroundService
         while (true)
         {
             var batch = await BatchReader.ReadBatchAsync(buffer.Reader, _options.BatchSize, _options.BatchWindow, stoppingToken);
-            await HandleBatchAsync(new ChannelDeliveryAcker(channel), batch, stoppingToken);
+            await HandleBatchAsync(channel, batch, stoppingToken);
         }
     }
 
-    private async Task HandleBatchAsync(IDeliveryAcker acker, List<InboundMessage> batch, CancellationToken stoppingToken)
+    private async Task HandleBatchAsync(IChannel channel, List<InboundMessage> batch, CancellationToken stoppingToken)
     {
+        var acker = new ChannelDeliveryAcker(channel);
         var stopwatch = Stopwatch.StartNew();
         BatchResult result;
 
-        try
+        while (true)
         {
-            // Not tied to the stopping token: a batch that has started is allowed to finish on shutdown.
-            result = await _processor.ProcessAsync(batch, CancellationToken.None);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Batch of {Count} wagers could not be stored; requeueing", batch.Count);
-            await _settler.RequeueAsync(batch, acker, CancellationToken.None);
-            await Task.Delay(_options.RequeueDelayMilliseconds, stoppingToken);
-            return;
+            try
+            {
+                // Not tied to the stopping token: a batch that has started is allowed to finish on shutdown.
+                stopwatch.Restart();
+                result = await _processor.ProcessAsync(batch, CancellationToken.None);
+                break;
+            }
+            catch (Exception ex) when (CasinoWagerBatchProcessor.IsRetryLater(ex))
+            {
+                await HoldAsync(channel, batch, ex, stoppingToken);
+            }
+            catch (Exception ex)
+            {
+                // Not a database outage: something unexpected. Hand the batch back to the broker.
+                _logger.LogError(ex, "Batch of {Count} wagers could not be stored; requeueing", batch.Count);
+                await _settler.RequeueAsync(batch, acker, CancellationToken.None);
+                await Task.Delay(_options.RequeueDelayMilliseconds, stoppingToken);
+                return;
+            }
         }
 
         await _settler.SettleAsync(batch, result, acker, CancellationToken.None);
@@ -130,5 +149,38 @@ internal sealed class CasinoWagerConsumerWorker : BackgroundService
             "Batch of {Count}: {Inserted} stored, {Duplicates} already stored, {DeadLettered} dead-lettered in {ElapsedMs} ms ({Total} total)",
             batch.Count, result.Inserted, result.Acknowledged.Count - result.Inserted, result.DeadLettered.Count,
             stopwatch.ElapsedMilliseconds, _totalInserted);
+    }
+
+    /// <summary>
+    /// Keeps the batch unacknowledged and waits before it is written again: until the circuit lets a
+    /// trial through if it is open, otherwise the configured requeue delay. Shutting down, or losing
+    /// the channel, ends the wait; the held deliveries then return to the queue and are redelivered.
+    /// </summary>
+    private async Task HoldAsync(IChannel channel, List<InboundMessage> batch, Exception reason, CancellationToken stoppingToken)
+    {
+        if (!channel.IsOpen)
+        {
+            throw new InvalidOperationException("The channel closed while a batch was being held; its deliveries will be redelivered.", reason);
+        }
+
+        var circuit = _processor.Circuit;
+        var wait = circuit.IsOpen ? circuit.RetryAfter : TimeSpan.FromMilliseconds(_options.RequeueDelayMilliseconds);
+        if (wait < MinimumHold)
+        {
+            wait = MinimumHold;
+        }
+
+        if (reason is BrokenCircuitException)
+        {
+            _logger.LogWarning("SQL Server circuit {State}: holding batch of {Count} wagers unacknowledged; next attempt in {Wait}",
+                circuit.State, batch.Count, wait);
+        }
+        else
+        {
+            _logger.LogError(reason, "Batch of {Count} wagers could not be stored; holding it unacknowledged and trying again in {Wait}",
+                batch.Count, wait);
+        }
+
+        await Task.Delay(wait, stoppingToken);
     }
 }

@@ -84,6 +84,10 @@ The API and Consumer depend on the abstractions in Core and wire the implementat
 - **Validation at the edge.** DataAnnotations reject malformed wagers with a `400 ValidationProblemDetails`. Identifiers are `Guid?`, so a missing id is a validation error rather than a silent `Guid.Empty`.
 - **`amount` is bound as `decimal`, never `double`.** A unit test caught that `(decimal)doubleValue` kept only about 15 significant digits (`38273.974454660885` became `38273.9744546609`). System.Text.Json parses the JSON number straight into `decimal`, so money never passes through binary floating point.
 - **Bus outage returns `503` with `Retry-After`**, via an `IExceptionHandler` and ProblemDetails, so callers can tell "retry later" from a bug.
+- **A circuit breaker fails fast when RabbitMQ is down.** Each publish is bounded by a 5-second timeout and runs behind a Polly circuit breaker. Once half of at least 20 publishes in 10 seconds have failed, the circuit opens for 15 seconds: requests get a `503` straight away, before a pooled channel is rented, with `Retry-After` set to the time left on the break. Without it, every request during an outage would hold one of the 16 channels while waiting to fail, and the pool would back up. After the break one request is let through as a trial; success closes the circuit, failure starts a new break.
+  - The timeout matters as much as the breaker. Under a memory or disk alarm RabbitMQ keeps the connection open but stops reading from publishers, so a publish would wait indefinitely and the breaker would never see a failure. The publisher also listens for the broker's "connection blocked" notification and opens the circuit immediately, closing it again on "unblocked".
+  - A publish that fails or times out empties its pool slot, because the channel may still be waiting on a confirm that will never be read. Caller cancellation is not counted as a broker failure.
+  - `/health/ready` reports `Degraded` while the circuit is not closed: reads still work, new wagers are being refused.
 - `GET {playerId}/casino` validates `page ≥ 1` and `1 ≤ pageSize ≤ 100`. `topSpenders` validates `1 ≤ count ≤ 100`. An unknown player returns an empty page, not a 404, because "no wagers yet" is a valid state.
 
 ### Consumer
@@ -94,7 +98,11 @@ The API and Consumer depend on the abstractions in Core and wire the implementat
 - **Poison messages are dead-lettered.**
   - A malformed message, or one that breaks database invariants, is published by the consumer to `ot.casino.wagers.dead` with an `ot-dead-letter-reason` header saying why. The original delivery is acked only after the broker confirms that publish, so a failed dead-letter publish means redelivery, not loss. The main queue also keeps its `x-dead-letter-exchange` argument as a safety net: anything rejected without requeue lands in the same queue instead of being dropped.
   - If SQL Server rejects a whole batch with a non-transient error, the processor writes each message individually. The one bad row is dead-lettered and the other 499 are stored. A row that cannot be joined is not inserted and is not added to the player total; the procedure fails the batch so that row is isolated.
-- **Transient errors are retried.** Deadlocks, timeouts, failover errors and any connection-level failure (SQL Server severity 20 and above, or a socket error) are retried with exponential backoff and jitter (Polly). If the database stays down, the batch is negatively acknowledged back to the queue and the consumer pauses for 5 seconds rather than spinning. Only errors about the data itself dead-letter a wager, so a database outage never does. This was caught in end-to-end testing: stopping SQL Server mid-run originally dead-lettered a valid wager, because a failed pre-login handshake was not on the retry list. With the fix, the wager waits in the queue and is stored once SQL Server is back.
+- **Transient errors are retried.** Deadlocks, timeouts, failover errors and any connection-level failure (SQL Server severity 20 and above, or a socket error) are retried with exponential backoff and jitter (Polly). If the database stays down, the batch is held, unacknowledged, and written again later (see the circuit breaker below). Only errors about the data itself dead-letter a wager, so a database outage never does. This was caught in end-to-end testing: stopping SQL Server mid-run originally dead-lettered a valid wager, because a failed pre-login handshake was not on the retry list. With the fix, the wager waits in the queue and is stored once SQL Server is back.
+- **A circuit breaker holds the batch during a database outage.** It sits outside the retries, so a batch that fails after all its retries counts as one failure; two such batches in a row open it for 30 seconds. While it is open the write is refused without touching SQL Server, and the worker keeps the current batch unacknowledged and waits for the break to pass instead of nacking and requeueing. Because nothing new is read, the prefetch limit stops the broker delivering more, so the backlog waits in the queue rather than cycling through nack and requeue every few seconds (which also inflated redelivery counts and the log). When the break is over the held batch is the trial write. Shutting down, or the channel closing, ends the hold and the deliveries are redelivered as before.
+  - Only transient errors count towards opening it. A row the database rejects is dealt with by isolation and dead-lettering; if it counted, one poison wager could stop the whole pipeline.
+  - An open circuit must never be mistaken for bad data. The processor treats any non-transient error as a rejected row, and Polly's "circuit open" exception is not a SQL transient error, so it is excluded explicitly; otherwise an outage would dead-letter every wager as "rejected by the database". A test pins this.
+  - Unexpected errors that are not database outages still requeue the batch and pause, as before.
 - **Testable core.** The settlement rules live in `CasinoWagerBatchProcessor`, which has no RabbitMQ dependency. The worker only translates its result into ack/nack calls.
 
 ### Database
@@ -149,19 +157,21 @@ Measured in a 2-vCPU Linux container with SQL Server 2022 and RabbitMQ 3 in Dock
 
 ## 6. Tests
 
-`dotnet test` runs 55 tests:
+`dotnet test` runs 75 tests:
 
 - **Consumer:**
   - batch window and size behaviour;
-  - settlement rules: dead-lettering, isolating a rejected row, transient retry, requeue after retries are exhausted, duplicates;
+  - settlement rules: dead-lettering, isolating a rejected row, transient retry, failure after retries are exhausted, duplicates;
+  - the SQL Server circuit breaker, on a fake clock: it opens after repeated transient failures and then refuses without calling the database; an open circuit is classed as "retry later", never as a rejected row; rejected rows never open it; a trial after the break closes it on success and reopens it on failure;
   - per-tag ack and requeue, including a batch whose tags are not a contiguous prefix, and a poison message that is not acked when the dead-letter publish fails;
   - message invariants.
 - **API (real ASP.NET Core pipeline via `WebApplicationFactory`, bus and database substituted):**
   - the brief's sample on the Tester's exact route and casing (`/api/Player/CasinoWager`, `"Username"`, `"Duration"`) returns `200`;
   - validation failures return `400`, including an empty `wagerId` or `accountId`;
-  - bus outage returns `503`;
+  - bus outage returns `503`, and an open circuit's remaining break becomes `Retry-After` in whole seconds, rounded up;
   - response shapes match the brief;
   - paging bounds are enforced.
+- **Publish circuit breaker:** the real publisher against a port with nothing listening, on a fake clock. Failures below the threshold carry no retry hint; after the threshold it refuses at once with `Retry-After` equal to the break; after the break the broker is tried again; it can be opened and closed by hand, as the "connection blocked" notification does. Settings validation and `Retry-After` rounding are covered too.
 - **Schema guard:** a test parses `DatabaseGenerate.sql` and checks that the TVP column order matches the C# `DataTable`. TVPs bind by position, so drift between the two would put values in the wrong columns.
 - **SQL integration** (runs when `OT_TEST_SQL_CONNECTION` is set; otherwise skipped):
   - idempotent re-writes;
@@ -184,6 +194,8 @@ CI (GitHub Actions) builds and runs the test suite on every push.
 - **Telling loss apart from duplicates.** The first load test stored 6,969 of 7,000. Before assuming lost messages, I checked every hop: all 7,000 requests got `200`, the queue was empty, nothing was dead-lettered, and the consumer had acknowledged 7,000 deliveries, 31 of them as "already stored". That pointed at the input, and the NBomber probe confirmed it. Logging duplicates per batch is what made this visible, so it stays in.
 - **Cold-start latency.** I assumed the cold p95 was the RabbitMQ connection and added a start-up warm-up for the channel pool. Re-measuring showed the warm-up is worthwhile but was not the main factor: on this 2-core machine the cold cost is mostly JIT compilation and the Tester's per-request TLS. The notes say so rather than over-claiming.
 - **Acknowledging one tag at a time.** The first version settled each batch with one `BasicAck(multiple: true)`. That is correct here: there is one channel and the buffer keeps delivery order, so a batch is always a contiguous run of tags, and a redelivered message comes back with a new, higher tag. But a multiple-ack settles *every* outstanding tag up to the one given, so it is only safe while that invariant holds, for example it would break if batches were ever processed in parallel. Each delivery is now acked or requeued on its own tag. Measured cost: total database-and-ack time for a 7,000-message backlog went from about 1.0 s to 1.6 s; the backlog still drained in 2.5 s.
+
+- **A circuit that never closed.** The first version of the publish breaker checked the circuit state before renting a channel, to fail fast. A test that advanced a fake clock past the break showed the circuit stayed open for good: Polly keeps reporting `Open` after the break has passed, until a call goes through and moves it to half-open, and the early check meant no call ever did. The early check now asks whether the break is still running, not what state Polly reports.
 
 ---
 

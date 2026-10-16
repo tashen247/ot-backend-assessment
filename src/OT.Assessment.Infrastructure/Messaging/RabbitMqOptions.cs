@@ -1,3 +1,5 @@
+using OT.Assessment.Infrastructure.Resilience;
+
 namespace OT.Assessment.Infrastructure.Messaging;
 
 public sealed class RabbitMqOptions
@@ -23,4 +25,21 @@ public sealed class RabbitMqOptions
     /// confirms independently, so this bounds in-flight publishes.
     /// </summary>
     public int PublisherChannelPoolSize { get; set; } = 16;
+
+    /// <summary>
+    /// Longest the API waits for the broker to confirm one publish. A broker under a memory or disk
+    /// alarm blocks publishers instead of refusing them, so without this bound a request could wait
+    /// indefinitely and the circuit breaker would never see a failure.
+    /// </summary>
+    public int PublishTimeoutMilliseconds { get; set; } = 5000;
+
+    /// <summary>API only: when to stop attempting publishes and answer 503 straight away.</summary>
+    public CircuitBreakerSettings PublishCircuitBreaker { get; set; } = new();
+
+    public TimeSpan PublishTimeout => TimeSpan.FromMilliseconds(PublishTimeoutMilliseconds);
+
+    public bool IsValid() =>
+        !string.IsNullOrWhiteSpace(HostName) && !string.IsNullOrWhiteSpace(Queue)
+        && PublisherChannelPoolSize > 0 && PublishTimeoutMilliseconds > 0
+        && PublishCircuitBreaker is not null && PublishCircuitBreaker.IsValid();
 }
