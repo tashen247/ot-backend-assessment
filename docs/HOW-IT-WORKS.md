@@ -239,7 +239,7 @@ Validation: `page ≥ 1`, `1 ≤ pageSize ≤ 100`, `1 ≤ count ≤ 100`; anyth
 |---|---|---|
 | Invalid request body | API returns `400` with field errors | Nothing is published |
 | RabbitMQ down when a wager is posted | Publish fails → `503` + `Retry-After: 5`. Once half of at least 20 publishes in 10 s have failed, the publish circuit opens for 15 s | While open, `503` comes back at once with `Retry-After` = time left on the break; no channels are tied up waiting |
-| RabbitMQ blocking publishers (memory or disk alarm) | Publish circuit opens as soon as the broker says it is blocked; any publish already waiting gives up after 5 s | `503` at once until the broker unblocks, then publishing resumes |
+| RabbitMQ blocking publishers (memory or disk alarm) | Publish circuit opens as soon as the broker says it is blocked; any publish already waiting gives up after 5 s and its channel is discarded in the background | `503` at once until the broker unblocks, or its connection is lost or recovered (for example after a restart), then publishing resumes |
 | RabbitMQ restarts while the apps run | Automatic connection recovery; closed pool channels are replaced on next use | Durable queues and persistent messages survive the restart |
 | API crashes after the confirm, before responding | The wager is already in the queue | Stored once; if the caller retries, the duplicate is skipped |
 | Consumer is not running | Wagers accumulate in `ot.casino.wagers` | Drained when it starts (about 7,000 in ~2.5 s) |
@@ -267,8 +267,8 @@ Both breakers are Polly v8 circuit breakers, and both are singletons, so every r
 |---|---|---|
 | What counts as a failure | Any publish error or 5 s timeout. Caller cancellation does not count | Only transient SQL errors that outlasted the 5 retries. A rejected row does not count, or one poison wager could stop the pipeline |
 | Opens when | Half of at least 20 publishes in 10 s fail, or the broker sends "connection blocked" | Both of at least 2 batches in 60 s fail |
-| Break | 15 s (until "unblocked" when the broker blocked) | 30 s |
-| While open | `503` at once, before a channel is rented, with `Retry-After` set to the time left | The batch is held unacknowledged and not retried until the break is over. Nothing new is read, and prefetch stops the broker delivering more |
+| Break | 15 s (until "unblocked", or the connection being lost or recovered, when the broker blocked) | 30 s |
+| While open | `503` at once, before a channel is rented, with `Retry-After` set to the time left | The batch is held unacknowledged and not retried until the break is over. Nothing new is read, and prefetch stops the broker delivering more. If the channel closes meanwhile, the hold ends at once and the deliveries are redelivered |
 | Visible in | `/health/ready` reports `Degraded`; a warning in the API log when it opens | Consumer log: `SQL Server circuit Open: holding batch of 500 wagers unacknowledged; next attempt in 00:00:30` |
 
 Two details that were easy to get wrong:

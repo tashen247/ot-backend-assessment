@@ -40,6 +40,7 @@ public sealed class RabbitMqCasinoWagerPublisher : ICasinoWagerPublisher, IAsync
     private readonly ResiliencePipeline _pipeline;
     private volatile bool _topologyDeclared;
     private IConnection _watchedConnection;
+    private int _isolatedByBroker;
 
     public RabbitMqCasinoWagerPublisher(
         RabbitMqConnectionProvider connectionProvider,
@@ -131,18 +132,44 @@ public sealed class RabbitMqCasinoWagerPublisher : ICasinoWagerPublisher, IAsync
             Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds())
         };
 
+        // WaitAsync stops waiting as soon as the token is cancelled (by the publish timeout or the caller),
+        // even if the client does not. A broker that is blocking publishers leaves the client's write
+        // stuck regardless of the token, which in testing held a request for 25 s against a 5 s
+        // timeout. The abandoned publish stays on this channel, which is then discarded.
         await lease.Channel.BasicPublishAsync(_options.Exchange, _options.RoutingKey, mandatory: true,
-            properties, MessageSerializer.Serialize(message), cancellationToken);
+                properties, MessageSerializer.Serialize(message), cancellationToken)
+            .AsTask()
+            .WaitAsync(cancellationToken);
     }
 
     private MessagePublishException Unavailable(CasinoWagerMessage message, Exception inner) =>
         new($"Wager {message.WagerId} was not published: RabbitMQ is unavailable (publish circuit {Circuit.State}).",
             inner ?? new BrokenCircuitException(), Circuit.RetryAfter);
 
+    /// <summary>
+    /// Empties the slot at once and closes the old channel in the background. Closing waits for the
+    /// broker to acknowledge, and a broker that is blocking publishers does not, so closing inline
+    /// held the request for about 20 s after the publish had already timed out.
+    /// </summary>
     private static void DiscardChannel(ChannelLease lease)
     {
-        lease.Channel?.Dispose();
+        var channel = lease.Channel;
         lease.Channel = null;
+
+        if (channel is not null)
+        {
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    channel.Dispose();
+                }
+                catch
+                {
+                    // Best effort: the channel is being thrown away because it is already broken.
+                }
+            });
+        }
     }
 
     /// <summary>
@@ -213,7 +240,8 @@ public sealed class RabbitMqCasinoWagerPublisher : ICasinoWagerPublisher, IAsync
     /// <summary>
     /// Under a memory or disk alarm the broker keeps the connection open but stops reading from
     /// publishers, and says so. Opening the circuit on that signal refuses wagers immediately instead
-    /// of letting requests time out one by one; it closes again when the broker unblocks.
+    /// of letting requests time out one by one; it closes again when the broker unblocks, or when
+    /// the blocked connection is lost or recovered.
     /// </summary>
     private void WatchForBlocking(IConnection connection)
     {
@@ -225,14 +253,32 @@ public sealed class RabbitMqCasinoWagerPublisher : ICasinoWagerPublisher, IAsync
         connection.ConnectionBlockedAsync += async (_, args) =>
         {
             _logger.LogWarning("RabbitMQ is blocking publishers: {Reason}", args.Reason);
+            Interlocked.Exchange(ref _isolatedByBroker, 1);
             await Circuit.ManualControl.IsolateAsync();
         };
 
-        connection.ConnectionUnblockedAsync += async (_, _) =>
+        connection.ConnectionUnblockedAsync += (_, _) => EndBrokerIsolationAsync("RabbitMQ has stopped blocking publishers");
+
+        // "Unblocked" is never sent if the blocked connection is lost instead, for example when the
+        // alarm ends with the broker restarting. Without these, the circuit would stay isolated and
+        // refuse every wager after the broker was healthy again. Once the connection is gone the
+        // isolation no longer describes anything; publishes that fail from here on trip the circuit
+        // in the ordinary way.
+        connection.ConnectionShutdownAsync += (_, _) => EndBrokerIsolationAsync("RabbitMQ connection closed while publishers were blocked");
+        connection.RecoverySucceededAsync += (_, _) => EndBrokerIsolationAsync("RabbitMQ connection recovered while publishers were blocked");
+    }
+
+    /// <summary>
+    /// Closes the circuit only if it was isolated because the broker blocked publishers; a circuit
+    /// opened by failed publishes is left to its own break.
+    /// </summary>
+    private async Task EndBrokerIsolationAsync(string reason)
+    {
+        if (Interlocked.Exchange(ref _isolatedByBroker, 0) == 1)
         {
-            _logger.LogInformation("RabbitMQ has stopped blocking publishers");
+            _logger.LogInformation("{Reason}; publishing resumes", reason);
             await Circuit.ManualControl.CloseAsync();
-        };
+        }
     }
 
     public async ValueTask DisposeAsync()

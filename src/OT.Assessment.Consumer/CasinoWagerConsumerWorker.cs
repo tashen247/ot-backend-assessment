@@ -92,9 +92,22 @@ internal sealed class CasinoWagerConsumerWorker : BackgroundService
             SingleWriter = true
         });
 
+        // Signalled when the channel closes, so a batch being held through a database outage stops
+        // waiting at once: its deliveries are going back to the queue and can no longer be acked here.
+        using var channelClosed = new CancellationTokenSource();
+
         channel.ChannelShutdownAsync += (_, args) =>
         {
             buffer.Writer.TryComplete(new InvalidOperationException($"Channel closed: {args.ReplyText}"));
+            try
+            {
+                channelClosed.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // ConsumeAsync has already returned.
+            }
+
             return Task.CompletedTask;
         };
 
@@ -109,11 +122,11 @@ internal sealed class CasinoWagerConsumerWorker : BackgroundService
         while (true)
         {
             var batch = await BatchReader.ReadBatchAsync(buffer.Reader, _options.BatchSize, _options.BatchWindow, stoppingToken);
-            await HandleBatchAsync(channel, batch, stoppingToken);
+            await HandleBatchAsync(channel, batch, channelClosed.Token, stoppingToken);
         }
     }
 
-    private async Task HandleBatchAsync(IChannel channel, List<InboundMessage> batch, CancellationToken stoppingToken)
+    private async Task HandleBatchAsync(IChannel channel, List<InboundMessage> batch, CancellationToken channelClosed, CancellationToken stoppingToken)
     {
         var acker = new ChannelDeliveryAcker(channel);
         var stopwatch = Stopwatch.StartNew();
@@ -130,7 +143,7 @@ internal sealed class CasinoWagerConsumerWorker : BackgroundService
             }
             catch (Exception ex) when (CasinoWagerBatchProcessor.IsRetryLater(ex))
             {
-                await HoldAsync(channel, batch, ex, stoppingToken);
+                await HoldAsync(channel, batch, ex, channelClosed, stoppingToken);
             }
             catch (Exception ex)
             {
@@ -156,11 +169,12 @@ internal sealed class CasinoWagerConsumerWorker : BackgroundService
     /// trial through if it is open, otherwise the configured requeue delay. Shutting down, or losing
     /// the channel, ends the wait; the held deliveries then return to the queue and are redelivered.
     /// </summary>
-    private async Task HoldAsync(IChannel channel, List<InboundMessage> batch, Exception reason, CancellationToken stoppingToken)
+    private async Task HoldAsync(
+        IChannel channel, List<InboundMessage> batch, Exception reason, CancellationToken channelClosed, CancellationToken stoppingToken)
     {
-        if (!channel.IsOpen)
+        if (!channel.IsOpen || channelClosed.IsCancellationRequested)
         {
-            throw new InvalidOperationException("The channel closed while a batch was being held; its deliveries will be redelivered.", reason);
+            throw ChannelLostWhileHolding(reason);
         }
 
         var circuit = _processor.Circuit;
@@ -181,6 +195,19 @@ internal sealed class CasinoWagerConsumerWorker : BackgroundService
                 batch.Count, wait);
         }
 
-        await Task.Delay(wait, stoppingToken);
+        using var waitCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, channelClosed);
+        try
+        {
+            await Task.Delay(wait, waitCts.Token);
+        }
+        catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
+        {
+            // Not a shutdown: the channel closed during the wait. Stop without writing the batch, so
+            // it is not stored only to fail to ack; the restart reconnects and its deliveries are redelivered.
+            throw ChannelLostWhileHolding(reason);
+        }
     }
+
+    private static InvalidOperationException ChannelLostWhileHolding(Exception reason) =>
+        new("The channel closed while a batch was being held; its deliveries will be redelivered.", reason);
 }
