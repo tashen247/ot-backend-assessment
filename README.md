@@ -7,6 +7,7 @@ A .NET 8 solution that captures casino wager events at load, stores them in SQL 
                    │ validate                                 ot.casino.wagers            │ buffer ▸ batch ▸ write ▸ ack
                    │ 200 once the broker has it               DLQ ot.casino.wagers.dead   │ bad message ▸ dead-letter
                    └──────────── GET endpoints ◀─────────────────────────────── stored procedures (Dapper)
+                                      │ topSpenders cached 5 s in Redis (shared; optional)
 ```
 
 ## Highlights
@@ -17,6 +18,7 @@ A .NET 8 solution that captures casino wager events at load, stores them in SQL 
 - **Nothing is silently lost.** Bad messages go to a dead-letter queue with the reason recorded; database and broker outages are retried and held, not dropped.
 - **Circuit breakers on both sides.** If RabbitMQ is down or blocking, the API stops trying and answers `503` at once with a `Retry-After`. If SQL Server is down, the consumer holds its batch unacknowledged and stops pulling more until the database recovers.
 - **Reads never wait for writes.** Read committed snapshot keeps both GET endpoints fast during load.
+- **The leaderboard is cached in Redis.** `topSpenders` is served from a cache shared by every API instance for up to 5 seconds, so SQL Server runs it about once per 5 seconds however many callers there are. Redis is optional: if it is down the API serves from SQL Server with no errors, and caching resumes as soon as Redis is back.
 
 ## Results against the provided Tester
 
@@ -25,16 +27,17 @@ A .NET 8 solution that captures casino wager events at load, stores them in SQL 
 | Tester requests | 7,000 / 7,000 returned 200 |
 | 7,000-message backlog | stored in about 2.5 s from consumer start |
 | GET endpoints during load | all 200, typically under 60 ms |
+| `topSpenders` under 20 concurrent readers while the Tester runs | p50 32 ms with Redis vs 53 ms without; SQL Server queried 6 times in 30 s instead of 9,542 |
 | Integrity | every distinct wager stored once; player totals reconcile with the wager table to the cent |
 
 Measured on a 2-vCPU machine running SQL Server, RabbitMQ, the API, the consumer and the Tester together. Details in [Notes.md](Notes.md#4-measured-results).
 
 ## Quick start
 
-Prerequisites: .NET 8 SDK, SQL Server on `localhost` (Windows authentication), RabbitMQ on `localhost:5672` with `guest/guest`.
+Prerequisites: .NET 8 SDK, SQL Server on `localhost` (Windows authentication), RabbitMQ on `localhost:5672` with `guest/guest`, and optionally Redis on `localhost:6379`.
 
 ```powershell
-# 1. RabbitMQ (management UI on http://localhost:15672)
+# 1. RabbitMQ (management UI on http://localhost:15672) and Redis
 docker compose up -d
 
 # 2. Database: run DatabaseGenerate.sql against your SQL Server (SSMS or sqlcmd); it is safe to re-run
@@ -50,7 +53,7 @@ dotnet run --project src/OT.Assessment.Consumer
 dotnet run --project test/OT.Assessment.Tester
 ```
 
-`GET https://localhost:7120/health/ready` reports whether SQL Server and RabbitMQ are reachable. Swagger is at `https://localhost:7120/swagger`. To use SQL Server in Docker instead, see [Notes.md](Notes.md#1-running-the-solution).
+`GET https://localhost:7120/health/ready` reports whether SQL Server and RabbitMQ are reachable, and `Degraded` (still a 200) if Redis is not. Swagger is at `https://localhost:7120/swagger`. To use SQL Server in Docker instead, see [Notes.md](Notes.md#1-running-the-solution).
 
 ## Endpoints
 
@@ -58,7 +61,7 @@ dotnet run --project test/OT.Assessment.Tester
 |---|---|---|
 | `POST` | `api/player/casinowager` | Accept a wager and publish it to the queue |
 | `GET` | `api/player/{playerId}/casino?pageSize=10&page=1` | A player's wagers, latest first, paged |
-| `GET` | `api/player/topSpenders?count=10` | Players by total amount wagered, highest first |
+| `GET` | `api/player/topSpenders?count=10` | Players by total amount wagered, highest first (cached up to 5 s) |
 
 ## Projects
 
@@ -66,9 +69,9 @@ dotnet run --project test/OT.Assessment.Tester
 |---|---|
 | `OT.Assessment.Core` | Message contract, read models and interfaces; no infrastructure dependencies |
 | `OT.Assessment.Infrastructure` | RabbitMQ connection, topology and confirmed publisher; Dapper repositories; health checks |
-| `OT.Assessment.App` | REST API: validation, mapping, HTTP concerns |
+| `OT.Assessment.App` | REST API: validation, mapping, HTTP concerns, the leaderboard cache |
 | `OT.Assessment.Consumer` | Background service: consume, batch, persist, settle |
-| `OT.Assessment.UnitTests` | Unit, API-pipeline and SQL Server integration tests |
+| `OT.Assessment.UnitTests` | Unit, API-pipeline, SQL Server and Redis integration tests |
 | `OT.Assessment.Tester` | The provided NBomber load test |
 
 ## Tests
@@ -77,6 +80,8 @@ dotnet run --project test/OT.Assessment.Tester
 dotnet test
 # include the SQL Server integration tests:
 $env:OT_TEST_SQL_CONNECTION = "Server=.;Database=OT_Assessment_DB;Integrated Security=SSPI;TrustServerCertificate=True;"
+# and the Redis integration tests:
+$env:OT_TEST_REDIS_CONNECTION = "localhost:6379"
 dotnet test
 ```
 

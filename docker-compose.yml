@@ -1,6 +1,6 @@
 # Local infrastructure for the OT assessment.
 #
-#   docker compose up -d                 -> RabbitMQ only (use your local SQL Server and the default connection string)
+#   docker compose up -d                 -> RabbitMQ and Redis (use your local SQL Server and the default connection string)
 #   docker compose --profile sql up -d   -> RabbitMQ and SQL Server 2022 (see Notes.md for the connection string override)
 #
 # RabbitMQ management UI: http://localhost:15672 (guest / guest)
@@ -14,6 +14,18 @@ services:
       - "15672:15672"
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Shared cache for GET topSpenders. Optional: if it is not running, the API serves from SQL Server.
+  redis:
+    image: redis:7-alpine
+    container_name: ot-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5

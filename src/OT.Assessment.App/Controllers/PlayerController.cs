@@ -1,5 +1,7 @@
 using System.ComponentModel.DataAnnotations;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.OutputCaching;
+using OT.Assessment.App.Caching;
 using OT.Assessment.App.Contracts;
 using OT.Assessment.App.ErrorHandling;
 using OT.Assessment.Core.Abstractions;
@@ -71,9 +73,14 @@ public sealed class PlayerController : ControllerBase
     }
 
     /// <summary>Returns the players with the highest total amount wagered, highest first.</summary>
+    /// <remarks>
+    /// Served from a shared cache for a few seconds (Caching:TopSpendersSeconds), so the leaderboard
+    /// may be that far behind the latest wagers.
+    /// </remarks>
     /// <param name="count">Number of players to return (1-100).</param>
     /// <param name="cancellationToken">Request cancellation.</param>
     [HttpGet("topSpenders")]
+    [OutputCache(PolicyName = CachingServiceCollectionExtensions.TopSpendersPolicy)]
     [ProducesResponseType(typeof(IReadOnlyList<TopSpender>), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
     public async Task<ActionResult<IReadOnlyList<TopSpender>>> GetTopSpenders(

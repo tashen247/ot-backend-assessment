@@ -22,6 +22,7 @@
 | .NET 8 SDK | |
 | RabbitMQ on `localhost:5672`, `guest/guest` | `docker compose up -d` from the repository root (management UI at http://localhost:15672), or the Windows service / `docker-up.bat` from the brief |
 | SQL Server 2022 on `localhost` with Windows authentication | Run **`DatabaseGenerate.sql`** once. It creates `OT_Assessment_DB` and all objects, and is safe to re-run |
+| Redis on `localhost:6379` (optional) | Started by the same `docker compose up -d`. Without it the API runs normally and serves the leaderboard from SQL Server; set `Caching__RedisConnectionString` to an empty string to use an in-memory cache per instance instead |
 
 The connection string is the one from the brief, plus `TrustServerCertificate=True`:
 
@@ -88,6 +89,12 @@ The API and Consumer depend on the abstractions in Core and wire the implementat
   - The timeout matters as much as the breaker. Under a memory or disk alarm RabbitMQ keeps the connection open but stops reading from publishers, so a publish would wait indefinitely and the breaker would never see a failure. The publisher also listens for the broker's "connection blocked" notification and opens the circuit immediately, closing it again on "unblocked", or when the blocked connection is lost or recovered, because "unblocked" is never sent if the alarm ends with the broker restarting.
   - A publish that fails or times out empties its pool slot, because the channel may still be waiting on a confirm that will never be read. Caller cancellation is not counted as a broker failure.
   - `/health/ready` reports `Degraded` while the circuit is not closed: reads still work, new wagers are being refused.
+- **The leaderboard is cached in Redis; nothing else is.** `GET topSpenders` uses .NET 8 output caching with a Redis store: responses are kept for 5 seconds, one entry per `count`, shared by every API instance.
+  - *Why this endpoint.* Every caller asks the same question, a leaderboard a few seconds behind is still correct, and a short expiry keeps it fresh with no invalidation logic. It is also the read that grows with the data, since it ranks every player. SQL Server answers it about once per 5 seconds whatever the read load.
+  - *Why not the others.* Player history differs per player and page, and a player expects a wager they just placed to appear, so caching it would need the consumer to evict that player's pages after every commit: cross-process invalidation for a query that is already a single index seek. The write path reads nothing. And Redis must not be used to spot duplicate wagers: if it said "seen" and the database write later failed, the wager would be lost; the idempotent insert is the guard.
+  - *Redis is optional and fails open.* Every cache call is bounded by a 250 ms timeout and runs behind a circuit breaker; a failure is a cache miss and the request is served from SQL Server. With Redis down the circuit opens within about a second, after which the API does not call Redis at all; the Redis client's "connection restored" event closes it again, so caching resumes as soon as Redis is back rather than when the break runs out. Failures are logged at most once per 10 seconds with a count, and `/health/ready` reports `Degraded` (still a 200) so the instance stays in rotation. The connection is configured to start without Redis and to fail commands at once while disconnected rather than queue them.
+  - *Shared, not per host.* By default .NET includes the host name in the cache key, so instances addressed by different names would each keep their own copy; the leaderboard is the same whichever host is asked, so the key ignores it.
+  - *Not a Redis-maintained leaderboard.* Having the consumer update a Redis sorted set after each commit would avoid SQL Server entirely, but with at-least-once delivery a batch that committed and then failed to ack is redelivered, and the sorted set would be incremented twice. SQL Server's totals only count rows the procedure actually inserted, so they stay the source of truth.
 - `GET {playerId}/casino` validates `page ≥ 1` and `1 ≤ pageSize ≤ 100`. `topSpenders` validates `1 ≤ count ≤ 100`. An unknown player returns an empty page, not a 404, because "no wagers yet" is a valid state.
 
 ### Consumer
@@ -132,7 +139,7 @@ The API and Consumer depend on the abstractions in Core and wire the implementat
 
 ## 4. Measured results
 
-Measured in a 2-vCPU Linux container with SQL Server 2022 and RabbitMQ 3 in Docker, with the API, Consumer and Tester all on the same machine. A real workstation should do better.
+Measured in a 2-vCPU Linux container with SQL Server 2022, RabbitMQ 3 and Redis 7, with the API, Consumer and Tester all on the same machine. A real workstation should do better.
 
 | Scenario | Result |
 |---|---|
@@ -143,6 +150,8 @@ Measured in a 2-vCPU Linux container with SQL Server 2022 and RabbitMQ 3 in Dock
 | **Consumer drain: 7,000 messages already queued** | **2.2 s, including process start-up**; 14 batches of 500; 1.5 s total database time; a warm 500-row batch takes ~40–80 ms |
 | GET endpoints during load | 200 OK in 85–210 ms while batches were being written |
 | **Circuit breakers, end to end** (same setup) | Normal Tester run: neither circuit tripped, 7,000 / 7,000 accepted. SQL Server stopped for 66 s mid-run: the consumer held 1,000 unacked with no requeue churn, the circuit opened, and once SQL Server was back the held batch was the trial write and the ~3,750 backlog drained within one break; all 7,000 accepted, nothing dead-lettered, totals reconciled. RabbitMQ stopped: 503s in under 20 ms, the circuit opened after ~20 failures, `Retry-After` counted down from 15, the first request after the break succeeded and closed it, and every wager that got a 200 was stored |
+| **`topSpenders` with and without Redis** (20 concurrent readers for 30 s while the Tester posts 7,000 wagers) | With Redis: ~500 req/s, p50 32 ms, p95 84 ms, p99 116 ms, and SQL Server ran the query **6 times**. With caching off: 317 req/s, p50 53 ms, p95 135 ms, p99 178 ms, and SQL Server ran it **9,542 times**. All requests 200 in both; the Tester's 7,000 wagers stored and reconciled in both |
+| **Redis killed and restarted under that load** | 0 failed requests out of 24,475. The circuit opened 1.4 s after Redis went down, with one warning logged; `/health/ready` reported `Degraded` with a 200. Caching resumed 0.33 s after Redis was back. A second API instance on another port served the first instance's cached entry |
 | Integrity after 3 runs (20,876 wagers) | `COUNT(*) = COUNT(DISTINCT WagerId)`; `SUM(Player.TotalAmountSpent) = SUM(CasinoWager.Amount)`; `SUM(TotalWagerCount) = COUNT(*)`; both queues empty; no errors logged |
 
 ---
@@ -158,7 +167,7 @@ Measured in a 2-vCPU Linux container with SQL Server 2022 and RabbitMQ 3 in Dock
 
 ## 6. Tests
 
-`dotnet test` runs 75 tests:
+`dotnet test` runs 93 tests:
 
 - **Consumer:**
   - batch window and size behaviour;
@@ -171,7 +180,10 @@ Measured in a 2-vCPU Linux container with SQL Server 2022 and RabbitMQ 3 in Dock
   - validation failures return `400`, including an empty `wagerId` or `accountId`;
   - bus outage returns `503`, and an open circuit's remaining break becomes `Retry-After` in whole seconds, rounded up;
   - response shapes match the brief;
-  - paging bounds are enforced.
+  - paging bounds are enforced;
+  - a repeat `topSpenders` request is served from the cache, each `count` is cached separately, one entry is shared whichever host is asked, and player history is never cached;
+  - with a cache store that fails every call, `topSpenders` still returns `200` from the database.
+- **Leaderboard cache:** the fail-open wrapper on a fake clock. A Redis error is a miss and never an exception; a hung call gives up after the timeout; the circuit opens after repeated failures and then stops calling Redis; it tries again after the break, and closes at once when Redis reconnects; caller cancellation propagates and is not counted; at most one warning per interval. With Redis configured but unreachable, the real store as the API builds it returns a miss in well under a second.
 - **Publish circuit breaker:** the real publisher against a port with nothing listening, on a fake clock. Failures below the threshold carry no retry hint; after the threshold it refuses at once with `Retry-After` equal to the break; after the break the broker is tried again; it can be opened and closed by hand, as the "connection blocked" notification does. Settings validation and `Retry-After` rounding are covered too.
 - **Schema guard:** a test parses `DatabaseGenerate.sql` and checks that the TVP column order matches the C# `DataTable`. TVPs bind by position, so drift between the two would put values in the wrong columns.
 - **SQL integration** (runs when `OT_TEST_SQL_CONNECTION` is set; otherwise skipped):
@@ -180,9 +192,11 @@ Measured in a 2-vCPU Linux container with SQL Server 2022 and RabbitMQ 3 in Dock
   - unknown player;
   - top-spender ordering;
   - same game name under two providers.
+- **Redis integration** (runs when `OT_TEST_REDIS_CONNECTION` is set; otherwise skipped): store, read and evict by tag through the wrapper, and expiry.
 
 ```powershell
 $env:OT_TEST_SQL_CONNECTION = "Server=.;Database=OT_Assessment_DB;Integrated Security=SSPI;TrustServerCertificate=True;"
+$env:OT_TEST_REDIS_CONNECTION = "localhost:6379"
 dotnet test
 ```
 
@@ -201,6 +215,7 @@ CI (GitHub Actions) builds and runs the test suite on every push.
   - If the broker restarted while blocking publishers, "unblocked" never arrived, so the isolated circuit stayed open and every wager got a `503` with the broker healthy again. The circuit now also closes when the blocked connection shuts down or recovers; after the fix the API accepted wagers again as soon as the broker was back.
   - The publish timeout did not bound the request: a blocked broker held the first request for 25 s against a 5 s timeout. Polly's timeout only cancels a token, and the client's blocked write ignores it, so the publish now waits with `WaitAsync`, which gives up regardless; and discarding the stuck channel, whose close waits for a broker that is not answering, now happens in the background. The same request now returns its `503` in 5.06 s.
   - The consumer checked its channel only before holding a batch, so a channel lost during a 30 s break went unnoticed until the batch had been written and the ack failed. The wait now ends as soon as the channel closes; with RabbitMQ restarted mid-break the hold ended within 3 s, and the held wagers were redelivered and stored once SQL Server was back.
+- **A cache outage tested under load.** Killing Redis while 20 clients read the leaderboard showed no failed requests, but 589 warnings before the circuit opened: with Redis down every request failed a read and a write, and the breaker trips on the *share* of failures, which a window full of successful hits from before the outage diluted. Warnings are now limited to one per 10 seconds with a count, and the sampling window is 5 s; the next run logged one warning. The same run showed caching resuming only when the 30 s break ran out, 15 s after Redis was already back, with SQL Server taking 4,111 avoidable queries meanwhile; closing the circuit on the client's "connection restored" event brought that to 68. And a second API instance on another port kept its own copy, because the default cache key includes the host; the key now ignores it.
 - **A circuit that never closed.** The first version of the publish breaker checked the circuit state before renting a channel, to fail fast. A test that advanced a fake clock past the break showed the circuit stayed open for good: Polly keeps reporting `Open` after the break has passed, until a call goes through and moves it to half-open, and the early check meant no call ever did. The early check now asks whether the break is still running, not what state Polly reports.
 
 ---
@@ -225,7 +240,7 @@ CI (GitHub Actions) builds and runs the test suite on every push.
 - Run several consumer instances. The procedure is already safe under concurrency. At higher volume, cache the provider, game and player ids in memory to shrink the per-batch upsert.
 - Keyset (seek) pagination on `(CreatedDateTime, CasinoWagerId)` instead of `OFFSET` for deep pages.
 - Partition `CasinoWager` by `CreatedDateTime`, with an archive or retention policy.
-- Short-lived caching of `topSpenders` (an output cache of a few seconds), since it is a leaderboard that tolerates slight staleness.
+- Redis with a replica and Sentinel (or a managed Redis) so the shared cache survives a node failure; today a Redis outage only costs the cache, by design.
 - If the API ever needed to write to the database as well as publish, a transactional outbox to keep the two consistent.
 
 **Security and operations**

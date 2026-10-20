@@ -141,6 +141,62 @@ public class PlayerControllerTests : IClassFixture<ApiFactory>
     }
 
     [Fact]
+    public async Task Get_top_spenders_serves_a_repeat_request_from_the_cache()
+    {
+        _factory.Players.GetTopSpendersAsync(7, Arg.Any<CancellationToken>()).Returns(
+            [new TopSpender { AccountId = Guid.NewGuid(), Username = "cached", TotalAmountSpend = 70m }]);
+
+        var first = await _client.GetAsync("/api/player/topSpenders?count=7");
+        var second = await _client.GetAsync("/api/player/topSpenders?count=7");
+
+        Assert.Equal(HttpStatusCode.OK, second.StatusCode);
+        Assert.Equal(await first.Content.ReadAsStringAsync(), await second.Content.ReadAsStringAsync());
+        Assert.NotNull(second.Headers.Age); // set by the output cache on a hit
+        await _factory.Players.Received(1).GetTopSpendersAsync(7, Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Get_top_spenders_caches_each_count_separately()
+    {
+        _factory.Players.GetTopSpendersAsync(Arg.Any<int>(), Arg.Any<CancellationToken>()).Returns([]);
+
+        await _client.GetAsync("/api/player/topSpenders?count=8");
+        await _client.GetAsync("/api/player/topSpenders?count=9");
+        await _client.GetAsync("/api/player/topSpenders?count=8");
+
+        await _factory.Players.Received(1).GetTopSpendersAsync(8, Arg.Any<CancellationToken>());
+        await _factory.Players.Received(1).GetTopSpendersAsync(9, Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Get_top_spenders_shares_one_cache_entry_whichever_host_is_asked()
+    {
+        _factory.Players.GetTopSpendersAsync(11, Arg.Any<CancellationToken>()).Returns([]);
+
+        foreach (var host in new[] { "api-1.internal", "api-2.internal" })
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, "/api/player/topSpenders?count=11");
+            request.Headers.Host = host;
+            Assert.Equal(HttpStatusCode.OK, (await _client.SendAsync(request)).StatusCode);
+        }
+
+        await _factory.Players.Received(1).GetTopSpendersAsync(11, Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Player_history_is_not_cached()
+    {
+        var accountId = Guid.NewGuid();
+        _factory.Players.GetCasinoWagersAsync(accountId, 1, 10, Arg.Any<CancellationToken>())
+            .Returns(new PagedResult<PlayerWager>([], page: 1, pageSize: 10, total: 0));
+
+        await _client.GetAsync($"/api/player/{accountId}/casino");
+        await _client.GetAsync($"/api/player/{accountId}/casino");
+
+        await _factory.Players.Received(2).GetCasinoWagersAsync(accountId, 1, 10, Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
     public async Task Get_top_spenders_rejects_a_count_out_of_range()
     {
         var response = await _client.GetAsync("/api/player/topSpenders?count=0");

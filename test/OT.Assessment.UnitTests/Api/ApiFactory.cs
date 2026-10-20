@@ -11,7 +11,7 @@ using OT.Assessment.Core.Abstractions;
 namespace OT.Assessment.UnitTests.Api;
 
 /// <summary>Hosts the real API pipeline (routing, model binding, validation, error handling) with the bus and database substituted.</summary>
-public sealed class ApiFactory : WebApplicationFactory<PlayerController>
+public class ApiFactory : WebApplicationFactory<PlayerController>
 {
     public ICasinoWagerPublisher Publisher { get; } = Substitute.For<ICasinoWagerPublisher>();
     public IPlayerReadRepository Players { get; } = Substitute.For<IPlayerReadRepository>();
@@ -19,6 +19,10 @@ public sealed class ApiFactory : WebApplicationFactory<PlayerController>
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Testing");
+
+        // The in-memory output cache: the suite must not depend on a Redis server.
+        builder.UseSetting("Caching:RedisConnectionString", string.Empty);
+
         builder.ConfigureTestServices(services =>
         {
             services.RemoveAll<IHostedService>();
@@ -26,6 +30,12 @@ public sealed class ApiFactory : WebApplicationFactory<PlayerController>
             services.RemoveAll<IPlayerReadRepository>();
             services.AddSingleton(Publisher);
             services.AddSingleton(Players);
+            ReplaceServices(services);
         });
+    }
+
+    /// <summary>Lets a derived factory substitute further services.</summary>
+    protected virtual void ReplaceServices(IServiceCollection services)
+    {
     }
 }

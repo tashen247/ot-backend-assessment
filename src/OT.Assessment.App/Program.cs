@@ -1,5 +1,6 @@
 using System.Reflection;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
+using OT.Assessment.App.Caching;
 using OT.Assessment.Infrastructure;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -11,6 +12,8 @@ builder.Services
     .AddSqlServerPersistence(builder.Configuration)
     .AddRabbitMq(builder.Configuration)
     .AddRabbitMqPublisher();
+
+builder.Services.AddTopSpendersCache(builder.Configuration);
 
 builder.Services.AddHealthChecks()
     .AddInfrastructureHealthChecks()
@@ -42,9 +45,11 @@ app.UseHttpsRedirection();
 
 app.UseAuthorization();
 
+app.UseOutputCache();
+
 app.MapControllers();
 
-// Liveness: the process is up. Readiness: SQL Server and RabbitMQ are reachable.
+// Liveness: the process is up. Readiness: SQL Server and RabbitMQ are reachable (Redis, when configured, can only degrade it).
 app.MapHealthChecks("/health/live", new HealthCheckOptions { Predicate = _ => false });
 app.MapHealthChecks("/health/ready", new HealthCheckOptions { Predicate = r => r.Tags.Contains(ServiceCollectionExtensions.ReadyTag) });
 

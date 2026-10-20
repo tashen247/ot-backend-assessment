@@ -39,7 +39,7 @@ The queue in the middle absorbs bursts. If wagers arrive faster than SQL Server 
 
 Each half of the write path also has a **circuit breaker** guarding the dependency it calls: the API guards RabbitMQ, and the Consumer guards SQL Server. When that dependency is clearly down, the breaker stops calls to it for a while instead of letting every call wait to fail (see [§7](#circuit-breakers)).
 
-**Reads** (`GET`) go straight from the API to SQL Server. They do not involve RabbitMQ at all.
+**Reads** (`GET`) go straight from the API to SQL Server. They do not involve RabbitMQ at all. The top spenders leaderboard is additionally cached in **Redis** for a few seconds, shared by every API instance (see [§6](#the-leaderboard-cache)). Redis is optional: without it, the leaderboard is simply read from SQL Server every time.
 
 ---
 
@@ -50,6 +50,7 @@ Each half of the write path also has a **circuit breaker** guarding the dependen
 | Service | Image | Ports | When it starts |
 |---|---|---|---|
 | `rabbitmq` (container `ot-rabbitmq`) | `rabbitmq:3-management` | `5672` AMQP (what the apps talk to), `15672` management web UI | Always: `docker compose up -d` |
+| `redis` (container `ot-redis`) | `redis:7-alpine` | `6379` | Always: `docker compose up -d`. Optional for the API |
 | `sqlserver` (container `ot-sqlserver`) | `mcr.microsoft.com/mssql/server:2022-latest` | `1433` | Only with the `sql` profile: `docker compose --profile sql up -d` |
 
 Things worth knowing:
@@ -64,7 +65,7 @@ Things worth knowing:
 Useful commands:
 
 ```powershell
-docker compose up -d                  # start RabbitMQ
+docker compose up -d                  # start RabbitMQ and Redis
 docker compose --profile sql up -d    # start RabbitMQ and SQL Server
 docker compose ps                     # status and health
 docker compose logs -f rabbitmq       # broker logs
@@ -227,6 +228,15 @@ Batch of 500: 497 stored, 3 already stored, 0 dead-lettered in 61 ms (6950 total
 | `GET api/player/{playerId}/casino?page=1&pageSize=10` | `usp_CasinoWager_GetByPlayer` | Returns two result sets: the total (read from `Player.TotalWagerCount`, no `COUNT(*)`) and the page. The covering index `IX_CasinoWager_PlayerId_CreatedDateTime` is already in "latest first" order, so no sort or key lookups. An unknown player returns an empty page, not a 404. |
 | `GET api/player/topSpenders?count=10` | `usp_Player_GetTopSpenders` | An ordered scan of `IX_Player_TotalAmountSpent` on the running totals, instead of summing every wager. |
 
+### The leaderboard cache
+
+`GET api/player/topSpenders` goes through ASP.NET Core **output caching** with a **Redis** store. The first request for a given `count` runs the procedure and stores the JSON response in Redis for **5 seconds**; every request for the same `count` in that time, to any API instance, is answered from Redis without touching SQL Server. A cached response carries an `Age` header.
+
+- **Why only this endpoint.** Every caller asks the same question, a leaderboard a few seconds behind is still correct, and the 5-second expiry keeps it fresh without anyone having to clear it. Player history differs per player and page, and a player expects a wager they just placed to show up, so caching it would mean the consumer clearing that player's pages after every commit.
+- **The key.** One entry per `count` (`SetVaryByQuery("count")`). The host name, included by default, is left out, so instances reached under different names still share one entry. Only `200` responses are cached, so a `400` for a bad `count` never is.
+- **Fail-open.** `FailOpenOutputCacheStore` wraps Microsoft's Redis store. Every Redis call has a **250 ms** timeout; any failure is treated as a cache miss, so the request is served from SQL Server instead. Behind it is a circuit breaker: once half of at least 10 calls in 5 s fail, the API stops calling Redis for 30 s, and closes the circuit at once when the Redis client reports its connection restored. A Redis outage therefore costs neither errors nor latency, only the cache.
+- **Stampedes.** When an entry expires, output caching lets one request per instance recompute it while concurrent requests for the same key wait for that result, so expiry never sends a burst of identical queries to SQL Server.
+
 `READ_COMMITTED_SNAPSHOT` is switched on for the database, so these reads see the last committed data and are **never blocked** by a batch transaction that is in progress.
 
 Validation: `page ≥ 1`, `1 ≤ pageSize ≤ 100`, `1 ≤ count ≤ 100`; anything else is a `400`.
@@ -250,6 +260,8 @@ Validation: `page ≥ 1`, `1 ≤ pageSize ≤ 100`, `1 ≤ count ≤ 100`; anyth
 | Malformed or invalid message | Published to `ot.casino.wagers.dead` with a reason, then acked | Visible in the DLQ for inspection |
 | One row rejected by the database | Batch retried one row at a time; that row is dead-lettered | The other rows are stored; the circuit is not affected |
 | Dead-letter publish fails | Original is not acked | Redelivered later; never dropped |
+| Redis down | Cache calls fail at once (the client does not queue commands while disconnected); the cache circuit opens within about a second | Every request still 200, served from SQL Server; `/health/ready` reports `Degraded` with a 200; caching resumes as soon as Redis reconnects |
+| Redis connected but slow | Each cache call gives up after 250 ms and counts as a failure; repeated failures open the cache circuit | Requests are at most 250 ms slower before the circuit opens, then not at all; a trial call every 30 s checks for recovery |
 | Batch fails for an unexpected reason (not a database outage) | Whole batch nacked with requeue; consumer pauses 5 s | Redelivered and tried again |
 | Consumer loop throws unexpectedly | Logged; consumer restarts after 5 s | Unacked messages are redelivered |
 
@@ -318,6 +330,16 @@ Both processes read `appsettings.json`. Any value can be overridden with an envi
 | `SamplingDurationSeconds` | `10` | `60` | Length of the window |
 | `BreakDurationSeconds` | `15` | `30` | How long the circuit stays open before a trial call |
 
+**`Caching`** (API only; validated at start-up)
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `TopSpendersSeconds` | `5` | How long a leaderboard response is cached, so how far behind it may be; `0` turns caching off |
+| `RedisConnectionString` | `localhost:6379` | StackExchange.Redis configuration; empty means an in-memory cache per instance |
+| `RedisInstanceName` | `ot-assessment:` | Prefix for every key, so applications can share a Redis |
+| `RedisTimeoutMilliseconds` | `250` | Longest wait for one cache call before treating it as a miss |
+| `RedisCircuitBreaker` | ratio `0.5`, throughput `10`, window `5` s, break `30` s | When to stop calling Redis; same settings shape as the other breakers |
+
 **`ConnectionStrings:DatabaseConnection`** defaults to local SQL Server with Windows authentication and `TrustServerCertificate=True`.
 
 ---
@@ -333,7 +355,9 @@ Both processes read `appsettings.json`. Any value can be overridden with an envi
 - **Experiment: database outage.** Stop SQL Server during a Tester run. The Consumer logs the circuit opening, *Unacked* settles at about 1,000 and *Ready* climbs. The dead-letter queue stays empty. Start SQL Server again: within one break the held batch is written, the circuit closes and the backlog drains.
 - **Experiment: broker outage.** Stop RabbitMQ (`docker compose stop`) and post a few wagers. The first ones take a moment to fail; once the circuit opens they come back `503` immediately with `Retry-After` counting down. Start RabbitMQ and, after the break, posts succeed again.
 
-**Health:** `GET https://localhost:7120/health/ready` reports whether SQL Server and RabbitMQ are reachable, and reports `Degraded` while the publish circuit is not closed; `/health/live` only says the process is up.
+**Redis:** `docker exec ot-redis redis-cli --scan --pattern 'ot-assessment:*'` lists the cached leaderboard entries; `curl -i` a `topSpenders` URL twice and the second response has an `Age` header. **Experiment:** stop Redis (`docker compose stop redis`) while reading the leaderboard: every request still returns 200, `/health/ready` turns `Degraded`, and the API log shows one warning and the circuit opening. Start it again and the log shows the cache resuming.
+
+**Health:** `GET https://localhost:7120/health/ready` reports whether SQL Server and RabbitMQ are reachable, and reports `Degraded` while the publish circuit is not closed or Redis is unreachable; `/health/live` only says the process is up.
 
 **Consumer log:** one line per batch with stored / already stored / dead-lettered counts and timing, and a warning while a batch is held.
 
@@ -374,7 +398,8 @@ Expect slightly fewer than 7,000 rows after one Tester run. The Tester itself se
 | `OT.Assessment.App` | `Controllers/PlayerController.cs` | The three endpoints |
 | | `Contracts/` | Request model and validation |
 | | `ErrorHandling/` | Bus failure → `503` with `Retry-After` (returned by the controller, logged once) |
+| | `Caching/` | The leaderboard output cache: policy, fail-open Redis store, shared connection, health check |
 | `OT.Assessment.Consumer` | `CasinoWagerConsumerWorker.cs` | Consume → buffer → batch → settle loop; holds a batch during a database outage |
 | | `Processing/` | Batch reader, processor (retries and circuit breaker), rules, transient-error classification, settler |
 | Root | `DatabaseGenerate.sql` | Tables, indexes, TVP type, stored procedures |
-| | `docker-compose.yml` | RabbitMQ (and optional SQL Server) |
+| | `docker-compose.yml` | RabbitMQ and Redis (and optional SQL Server) |
