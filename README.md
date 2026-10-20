@@ -27,7 +27,7 @@ A .NET 8 solution that captures casino wager events at load, stores them in SQL 
 | Tester requests | 7,000 / 7,000 returned 200 |
 | 7,000-message backlog | stored in about 2.5 s from consumer start |
 | GET endpoints during load | all 200, typically under 60 ms |
-| `topSpenders` under 20 concurrent readers while the Tester runs | p50 32 ms with Redis vs 53 ms without; SQL Server queried 6 times in 30 s instead of 9,542 |
+| `topSpenders` under 20 concurrent readers while the Tester runs | p50 32–38 ms with Redis vs 53–55 ms without; SQL Server queried 6–7 times in 30 s instead of about 9,000 |
 | Integrity | every distinct wager stored once; player totals reconcile with the wager table to the cent |
 
 Measured on a 2-vCPU machine running SQL Server, RabbitMQ, the API, the consumer and the Tester together. Details in [Notes.md](Notes.md#4-measured-results).

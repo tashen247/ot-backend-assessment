@@ -234,7 +234,14 @@ Batch of 500: 497 stored, 3 already stored, 0 dead-lettered in 61 ms (6950 total
 
 - **Why only this endpoint.** Every caller asks the same question, a leaderboard a few seconds behind is still correct, and the 5-second expiry keeps it fresh without anyone having to clear it. Player history differs per player and page, and a player expects a wager they just placed to show up, so caching it would mean the consumer clearing that player's pages after every commit.
 - **The key.** One entry per `count` (`SetVaryByQuery("count")`). The host name, included by default, is left out, so instances reached under different names still share one entry. Only `200` responses are cached, so a `400` for a bad `count` never is.
-- **Fail-open.** `FailOpenOutputCacheStore` wraps Microsoft's Redis store. Every Redis call has a **250 ms** timeout; any failure is treated as a cache miss, so the request is served from SQL Server instead. Behind it is a circuit breaker: once half of at least 10 calls in 5 s fail, the API stops calling Redis for 30 s, and closes the circuit at once when the Redis client reports its connection restored. A Redis outage therefore costs neither errors nor latency, only the cache.
+- **Fail-open.** The output cache middleware already treats an exception from the store as a miss, so a dead Redis never fails a request. `FailOpenOutputCacheStore` wraps Microsoft's Redis store to add what the middleware lacks:
+  - every read has a **250 ms** timeout, and a slow or failed read is a miss served from SQL Server;
+  - writes go to Redis in the background, because the middleware waits for the write before finishing the response;
+  - a circuit breaker: once half of at least 10 calls in 5 s fail, the API stops calling Redis for 30 s, and closes the circuit at once when the Redis client reports its connection restored;
+  - Redis calls run on their own token, so a request that goes away mid-call does not count as a success and close the circuit on a broken Redis;
+  - failures are logged at most once per 10 s.
+
+  A Redis outage therefore costs no errors, at most one 250 ms timeout per request until the circuit opens, and nothing after that. The connection is opened as the API starts, so the first requests do not wait for it.
 - **Stampedes.** When an entry expires, output caching lets one request per instance recompute it while concurrent requests for the same key wait for that result, so expiry never sends a burst of identical queries to SQL Server.
 
 `READ_COMMITTED_SNAPSHOT` is switched on for the database, so these reads see the last committed data and are **never blocked** by a batch transaction that is in progress.
@@ -260,8 +267,9 @@ Validation: `page ≥ 1`, `1 ≤ pageSize ≤ 100`, `1 ≤ count ≤ 100`; anyth
 | Malformed or invalid message | Published to `ot.casino.wagers.dead` with a reason, then acked | Visible in the DLQ for inspection |
 | One row rejected by the database | Batch retried one row at a time; that row is dead-lettered | The other rows are stored; the circuit is not affected |
 | Dead-letter publish fails | Original is not acked | Redelivered later; never dropped |
-| Redis down | Cache calls fail at once (the client does not queue commands while disconnected); the cache circuit opens within about a second | Every request still 200, served from SQL Server; `/health/ready` reports `Degraded` with a 200; caching resumes as soon as Redis reconnects |
-| Redis connected but slow | Each cache call gives up after 250 ms and counts as a failure; repeated failures open the cache circuit | Requests are at most 250 ms slower before the circuit opens, then not at all; a trial call every 30 s checks for recovery |
+| Redis down | Cache calls fail at once once the client's first connection attempt, started with the API, has finished (it does not queue commands while disconnected); the cache circuit opens within about a second | Every request still 200, served from SQL Server; `/health/ready` reports `Degraded` with a 200; caching resumes as soon as Redis reconnects |
+| Redis connected but slow | Each read gives up after 250 ms and counts as a failure, and so does each background write; repeated failures open the cache circuit | Requests are at most one 250 ms timeout slower until the circuit opens (about a second under load), then not at all; a trial call every 30 s checks for recovery |
+| Malformed `Caching:RedisConnectionString` | Checked when the API starts | The API refuses to start, naming the setting: a configuration error, unlike Redis being unavailable |
 | Batch fails for an unexpected reason (not a database outage) | Whole batch nacked with requeue; consumer pauses 5 s | Redelivered and tried again |
 | Consumer loop throws unexpectedly | Logged; consumer restarts after 5 s | Unacked messages are redelivered |
 
@@ -335,7 +343,7 @@ Both processes read `appsettings.json`. Any value can be overridden with an envi
 | Setting | Default | Meaning |
 |---|---|---|
 | `TopSpendersSeconds` | `5` | How long a leaderboard response is cached, so how far behind it may be; `0` turns caching off |
-| `RedisConnectionString` | `localhost:6379` | StackExchange.Redis configuration; empty means an in-memory cache per instance |
+| `RedisConnectionString` | `localhost:6379` | StackExchange.Redis configuration; empty (or a single space) means an in-memory cache per instance. In PowerShell assigning `""` deletes the variable, so use `" "` to override it |
 | `RedisInstanceName` | `ot-assessment:` | Prefix for every key, so applications can share a Redis |
 | `RedisTimeoutMilliseconds` | `250` | Longest wait for one cache call before treating it as a miss |
 | `RedisCircuitBreaker` | ratio `0.5`, throughput `10`, window `5` s, break `30` s | When to stop calling Redis; same settings shape as the other breakers |

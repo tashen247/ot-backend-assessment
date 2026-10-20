@@ -53,7 +53,7 @@ public sealed class RedisCacheIntegrationTests : IAsyncLifetime
         byte[] value = [1, 2, 3, 4];
 
         await _store.SetAsync("leaderboard", value, [CachingServiceCollectionExtensions.TopSpendersTag], TimeSpan.FromSeconds(30), CancellationToken.None);
-        Assert.Equal(value, await _store.GetAsync("leaderboard", CancellationToken.None));
+        Assert.Equal(value, await ReadOnceWrittenAsync("leaderboard"));
 
         await _store.EvictByTagAsync(CachingServiceCollectionExtensions.TopSpendersTag, CancellationToken.None);
         Assert.Null(await _store.GetAsync("leaderboard", CancellationToken.None));
@@ -63,11 +63,27 @@ public sealed class RedisCacheIntegrationTests : IAsyncLifetime
     public async Task Entries_expire_after_their_duration()
     {
         await _store.SetAsync("short", [7], [], TimeSpan.FromSeconds(1), CancellationToken.None);
-        Assert.NotNull(await _store.GetAsync("short", CancellationToken.None));
+        Assert.NotNull(await ReadOnceWrittenAsync("short"));
 
         await Task.Delay(TimeSpan.FromSeconds(1.5));
 
         Assert.Null(await _store.GetAsync("short", CancellationToken.None));
+    }
+
+    /// <summary>Writes go to Redis in the background, so a read straight after may briefly miss.</summary>
+    private async Task<byte[]> ReadOnceWrittenAsync(string key)
+    {
+        for (var i = 0; i < 50; i++)
+        {
+            if (await _store.GetAsync(key, CancellationToken.None) is { } value)
+            {
+                return value;
+            }
+
+            await Task.Delay(10);
+        }
+
+        return null;
     }
 
     public async Task DisposeAsync()

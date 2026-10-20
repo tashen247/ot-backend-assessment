@@ -80,6 +80,7 @@ public class FailOpenOutputCacheStoreTests
         _redis.GetAsync(default, default).ReturnsForAnyArgs(new ValueTask<byte[]>(never.Task));
 
         var read = _store.GetAsync("k", CancellationToken.None).AsTask();
+        await RedisCalledAsync(nameof(IOutputCacheStore.GetAsync), 1);
         Assert.False(read.IsCompleted);
 
         _time.Advance(Timeout + TimeSpan.FromMilliseconds(1));
@@ -154,16 +155,70 @@ public class FailOpenOutputCacheStoreTests
     }
 
     [Fact]
-    public async Task Caller_cancellation_propagates_and_does_not_count_against_redis()
+    public async Task A_caller_that_stops_waiting_is_released_at_once()
     {
-        using var cancelled = new CancellationTokenSource();
-        cancelled.Cancel();
+        var never = new TaskCompletionSource<byte[]>();
+        _redis.GetAsync(default, default).ReturnsForAnyArgs(new ValueTask<byte[]>(never.Task));
+        using var caller = new CancellationTokenSource();
 
-        for (var i = 0; i < 3; i++)
+        var read = _store.GetAsync("k", caller.Token).AsTask();
+        caller.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => read.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task A_cancelled_trial_after_the_break_does_not_close_the_circuit_on_a_broken_redis()
+    {
+        await OpenTheCircuitAsync();
+        var never = new TaskCompletionSource<byte[]>();
+        _redis.GetAsync(default, default).ReturnsForAnyArgs(new ValueTask<byte[]>(never.Task)); // still broken: it hangs
+        _time.Advance(BreakDuration + TimeSpan.FromSeconds(1));
+        _redis.ClearReceivedCalls();
+        using var caller = new CancellationTokenSource();
+
+        var trial = _store.GetAsync("k", caller.Token).AsTask();
+        await RedisCalledAsync(nameof(IOutputCacheStore.GetAsync), 1);
+        caller.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => trial.WaitAsync(TimeSpan.FromSeconds(5)));
+
+        // The trial carries on without the caller and times out against the hung Redis.
+        _time.Advance(Timeout + TimeSpan.FromMilliseconds(1));
+        await WaitUntilAsync(() => _store.Circuit.IsOpen);
+
+        Assert.Equal(CircuitState.Open, _store.Circuit.State);
+    }
+
+    [Fact]
+    public async Task Writes_do_not_hold_up_the_request_and_still_count_when_redis_hangs()
+    {
+        var never = new TaskCompletionSource();
+        _redis.SetAsync(default, default, default, default, default).ReturnsForAnyArgs(new ValueTask(never.Task));
+
+        for (var i = 0; i < 2; i++)
         {
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => _store.GetAsync("k", cancelled.Token).AsTask());
+            Assert.True(_store.SetAsync("k", [1], ["t"], TimeSpan.FromSeconds(5), CancellationToken.None).IsCompletedSuccessfully);
         }
 
-        Assert.Equal(CircuitState.Closed, _store.Circuit.State);
+        await RedisCalledAsync(nameof(IOutputCacheStore.SetAsync), 2);
+        _time.Advance(Timeout + TimeSpan.FromMilliseconds(1));
+        await WaitUntilAsync(() => _store.Circuit.IsOpen);
+    }
+
+    /// <summary>
+    /// Waits until the call has reached Redis, by which point its timeout is running. Advancing the
+    /// fake clock before then would leave the timeout behind and the call hanging for good.
+    /// </summary>
+    private Task RedisCalledAsync(string method, int times) =>
+        WaitUntilAsync(() => _redis.ReceivedCalls().Count(c => c.GetMethodInfo().Name == method) >= times);
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        for (var i = 0; i < 200 && !condition(); i++)
+        {
+            await Task.Delay(10);
+        }
+
+        Assert.True(condition(), "condition not reached within 2 s");
     }
 }

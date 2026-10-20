@@ -1,4 +1,5 @@
 using OT.Assessment.Infrastructure.Resilience;
+using StackExchange.Redis;
 
 namespace OT.Assessment.App.Caching;
 
@@ -49,5 +50,23 @@ public sealed class CachingOptions
 
     public bool IsValid() =>
         TopSpendersSeconds >= 0 && RedisTimeoutMilliseconds > 0
-        && RedisCircuitBreaker is not null && RedisCircuitBreaker.IsValid();
+        && RedisCircuitBreaker is not null && RedisCircuitBreaker.IsValid()
+        && (!UseRedis || IsValidRedisConfiguration(RedisConnectionString));
+
+    /// <summary>
+    /// A malformed connection string is a configuration error, not Redis being unavailable, so it is
+    /// reported at start-up with the other settings instead of surfacing later from inside the client.
+    /// </summary>
+    private static bool IsValidRedisConfiguration(string connectionString)
+    {
+        try
+        {
+            ConfigurationOptions.Parse(connectionString);
+            return true;
+        }
+        catch (Exception ex) when (ex is ArgumentException or FormatException)
+        {
+            return false;
+        }
+    }
 }

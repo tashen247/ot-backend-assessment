@@ -6,14 +6,22 @@ using Polly.CircuitBreaker;
 namespace OT.Assessment.App.Caching;
 
 /// <summary>
-/// Wraps the Redis output cache so that Redis being slow or down never fails or slows a request.
+/// Wraps the Redis output cache so that Redis being slow or down adds at most one short timeout to a
+/// request, and nothing at all once it is known to be down.
 /// <para>
-/// Every call is bounded by a short timeout. A failed read is treated as a miss, so the request is
-/// served from SQL Server as it would be with no cache, and a failed write or eviction is dropped.
-/// A circuit breaker stops calling Redis at all once it keeps failing, so an outage costs nothing
-/// per request while it lasts, and lets a trial call through after the break to find out whether
-/// it has recovered.
+/// ASP.NET Core's output cache middleware already treats an exception from the store as a miss, so
+/// a dead Redis never fails a request on its own. What it does not do is bound how long a call may
+/// take, stop calling a Redis that keeps failing, or keep an outage out of the request path, and
+/// that is what this adds:
 /// </para>
+/// <list type="bullet">
+/// <item>Every call has a short timeout; a read that fails or times out is a miss.</item>
+/// <item>Writes happen in the background. The middleware waits for the store before finishing the
+/// request, so an awaited write would add a second timeout to every miss.</item>
+/// <item>A circuit breaker stops calling Redis once it keeps failing, and the circuit closes as soon
+/// as the Redis client reconnects.</item>
+/// <item>Failures are logged at most once per interval.</item>
+/// </list>
 /// </summary>
 internal sealed class FailOpenOutputCacheStore : IOutputCacheStore, IDisposable
 {
@@ -24,11 +32,12 @@ internal sealed class FailOpenOutputCacheStore : IOutputCacheStore, IDisposable
     internal static readonly TimeSpan WarningInterval = TimeSpan.FromSeconds(10);
 
     private readonly IOutputCacheStore _inner;
+    private readonly ILogger<FailOpenOutputCacheStore> _logger;
     private readonly TimeProvider _time;
+    private readonly ResiliencePipeline _pipeline;
     private long _nextWarningTicks;
     private int _suppressedWarnings;
-    private readonly ILogger<FailOpenOutputCacheStore> _logger;
-    private readonly ResiliencePipeline _pipeline;
+    private int _resuming;
 
     public FailOpenOutputCacheStore(
         IOutputCacheStore inner,
@@ -38,15 +47,14 @@ internal sealed class FailOpenOutputCacheStore : IOutputCacheStore, IDisposable
     {
         _inner = inner;
         _logger = logger;
-        var time = timeProvider ?? TimeProvider.System;
-        _time = time;
+        _time = timeProvider ?? TimeProvider.System;
 
-        Circuit = new CircuitBreakerTracker("Redis cache", options.RedisCircuitBreaker, logger, time);
+        Circuit = new CircuitBreakerTracker("Redis cache", options.RedisCircuitBreaker, logger, _time);
 
-        // Breaker outermost, so a call that times out counts as one failure. Caller cancellation
-        // (the request went away) says nothing about Redis and is not counted.
-        _pipeline = new ResiliencePipelineBuilder { TimeProvider = time }
-            .AddCircuitBreaker(Circuit.CreateOptions(ex => ex is not OperationCanceledException))
+        // Breaker outermost, so a call that times out counts as one failure. The pipeline never sees
+        // the caller's token (see RunAsync), so every outcome it records is Redis's own.
+        _pipeline = new ResiliencePipelineBuilder { TimeProvider = _time }
+            .AddCircuitBreaker(Circuit.CreateOptions(_ => true))
             .AddTimeout(options.RedisTimeout)
             .Build();
     }
@@ -62,10 +70,20 @@ internal sealed class FailOpenOutputCacheStore : IOutputCacheStore, IDisposable
     /// </summary>
     public async Task ResumeAsync()
     {
-        if (Circuit.State != CircuitState.Closed)
+        // The client reports each of its connections separately, so this can be called twice at once.
+        if (Circuit.State == CircuitState.Closed || Interlocked.Exchange(ref _resuming, 1) == 1)
+        {
+            return;
+        }
+
+        try
         {
             _logger.LogInformation("Redis is reachable again; resuming the cache");
             await Circuit.ManualControl.CloseAsync();
+        }
+        finally
+        {
+            Volatile.Write(ref _resuming, 0);
         }
     }
 
@@ -76,39 +94,44 @@ internal sealed class FailOpenOutputCacheStore : IOutputCacheStore, IDisposable
             return null;
         }
 
+        var read = RunAsync(static (inner, state, token) => inner.GetAsync(state, token), key);
+
         try
         {
-            // WaitAsync gives up when the timeout fires even if the client does not, as with the publisher.
-            return await _pipeline.ExecuteAsync(
-                static async (state, token) => await state.Inner.GetAsync(state.Key, token).AsTask().WaitAsync(token),
-                (Inner: _inner, Key: key),
-                cancellationToken);
+            // The caller can stop waiting at any time; the read itself carries on until Redis answers
+            // or the timeout fires, so the breaker records what Redis did, not what the caller did.
+            // Otherwise a request that went away during the half-open trial would count as a success
+            // and close the circuit on a Redis that is still broken.
+            return await read.WaitAsync(cancellationToken);
         }
-        catch (Exception ex) when (IsCacheFailure(ex, cancellationToken))
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            ObserveInBackground(read);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            LogFailure(ex);
             return null;
         }
     }
 
-    public async ValueTask SetAsync(string key, byte[] value, string[] tags, TimeSpan validFor, CancellationToken cancellationToken)
+    public ValueTask SetAsync(string key, byte[] value, string[] tags, TimeSpan validFor, CancellationToken cancellationToken)
     {
-        if (Circuit.IsOpen)
+        if (!Circuit.IsOpen)
         {
-            return;
+            // Not awaited: the response has been written by now, and the middleware would otherwise hold
+            // the request open until Redis answered or the timeout fired.
+            _ = WriteInBackgroundAsync(RunAsync(
+                static async (inner, state, token) =>
+                {
+                    await inner.SetAsync(state.Key, state.Value, state.Tags, state.ValidFor, token);
+                    return true;
+                },
+                (Key: key, Value: value, Tags: tags, ValidFor: validFor)));
         }
 
-        try
-        {
-            await _pipeline.ExecuteAsync(
-                static async (state, token) =>
-                    await state.Inner.SetAsync(state.Key, state.Value, state.Tags, state.ValidFor, token).AsTask().WaitAsync(token),
-                (Inner: _inner, Key: key, Value: value, Tags: tags, ValidFor: validFor),
-                cancellationToken);
-        }
-        catch (Exception ex) when (IsCacheFailure(ex, cancellationToken))
-        {
-            // The response has already been served; it simply is not cached this time.
-        }
+        return ValueTask.CompletedTask;
     }
 
     public async ValueTask EvictByTagAsync(string tag, CancellationToken cancellationToken)
@@ -120,39 +143,62 @@ internal sealed class FailOpenOutputCacheStore : IOutputCacheStore, IDisposable
 
         try
         {
-            await _pipeline.ExecuteAsync(
-                static async (state, token) => await state.Inner.EvictByTagAsync(state.Tag, token).AsTask().WaitAsync(token),
-                (Inner: _inner, Tag: tag),
-                cancellationToken);
+            await RunAsync(
+                static async (inner, state, token) =>
+                {
+                    await inner.EvictByTagAsync(state, token);
+                    return true;
+                },
+                tag).WaitAsync(cancellationToken);
         }
-        catch (Exception ex) when (IsCacheFailure(ex, cancellationToken))
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
         {
             // Entries expire on their own within the configured duration.
+            LogFailure(ex);
         }
     }
 
     /// <summary>
-    /// True for anything that should be absorbed: Redis errors, timeouts and an open circuit. False
-    /// when the caller cancelled, so that cancellation propagates as it would without a cache.
+    /// One Redis call through the breaker and the timeout. WaitAsync gives up when the timeout fires
+    /// even if the Redis client does not, as with the publisher.
     /// </summary>
-    private bool IsCacheFailure(Exception exception, CancellationToken cancellationToken)
+    private Task<TResult> RunAsync<TState, TResult>(
+        Func<IOutputCacheStore, TState, CancellationToken, ValueTask<TResult>> call, TState state) =>
+        _pipeline.ExecuteAsync(
+            static async (context, token) => await context.Call(context.Inner, context.State, token).AsTask().WaitAsync(token),
+            (Inner: _inner, Call: call, State: state),
+            CancellationToken.None).AsTask();
+
+    private async Task WriteInBackgroundAsync(Task<bool> write)
     {
-        if (cancellationToken.IsCancellationRequested)
+        try
         {
-            return false;
+            await write;
         }
-
-        // An open circuit was logged once when it opened; only individual failures before that are logged.
-        if (exception is not BrokenCircuitException)
+        catch (Exception ex)
         {
-            LogFailure(exception);
+            // The response has already been served; it simply is not cached this time.
+            LogFailure(ex);
         }
-
-        return true;
     }
+
+    /// <summary>Keeps an abandoned read's eventual failure from going unobserved.</summary>
+    private static void ObserveInBackground(Task task) =>
+        _ = task.ContinueWith(static t => _ = t.Exception, CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
 
     private void LogFailure(Exception exception)
     {
+        // An open circuit was logged once when it opened; only individual failures before that are logged.
+        if (exception is BrokenCircuitException)
+        {
+            return;
+        }
+
         var now = _time.GetUtcNow().UtcTicks;
         var next = Interlocked.Read(ref _nextWarningTicks);
 

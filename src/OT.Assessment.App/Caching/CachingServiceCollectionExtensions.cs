@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.OutputCaching;
 using Microsoft.AspNetCore.OutputCaching.StackExchangeRedis;
+using Microsoft.Extensions.Options;
 using OT.Assessment.Infrastructure;
 
 namespace OT.Assessment.App.Caching;
@@ -16,21 +17,31 @@ internal static class CachingServiceCollectionExtensions
     /// store is Redis, wrapped so that a Redis failure is a cache miss rather than an error; without
     /// one it is the in-memory store.
     /// </summary>
+    private const string InvalidSettingsMessage =
+        "Caching settings are invalid: TopSpendersSeconds must be 0 or more, RedisTimeoutMilliseconds positive, " +
+        "RedisConnectionString a valid StackExchange.Redis configuration (or empty), and RedisCircuitBreaker needs " +
+        "a FailureRatio in (0, 1], MinimumThroughput of at least 2 and durations of at least 1 second.";
+
     public static IServiceCollection AddTopSpendersCache(this IServiceCollection services, IConfiguration configuration)
     {
         services.AddOptions<CachingOptions>()
             .Bind(configuration.GetSection(CachingOptions.SectionName))
-            .Validate(o => o.IsValid(),
-                "Caching settings are invalid: TopSpendersSeconds must be 0 or more, RedisTimeoutMilliseconds positive, " +
-                "and RedisCircuitBreaker needs a FailureRatio in (0, 1], MinimumThroughput of at least 2 and durations of at least 1 second.")
+            .Validate(o => o.IsValid(), InvalidSettingsMessage)
             .ValidateOnStart();
 
-        // The policy and store are chosen at registration, so the settings are read here as well.
+        // The policy and store are chosen here, so the settings are read and checked here too: the Redis
+        // connection is created while the hosted services start, which is before ValidateOnStart runs,
+        // and a malformed connection string would otherwise fail there with the client's own error.
         var settings = configuration.GetSection(CachingOptions.SectionName).Get<CachingOptions>() ?? new CachingOptions();
+        if (!settings.IsValid())
+        {
+            throw new OptionsValidationException(CachingOptions.SectionName, typeof(CachingOptions), [InvalidSettingsMessage]);
+        }
 
         if (settings.UseRedis)
         {
             services.AddSingleton(sp => new RedisConnection(settings, sp.GetRequiredService<ILogger<RedisConnection>>()));
+            services.AddHostedService<RedisConnectionWarmup>();
 
             services.AddStackExchangeRedisOutputCache(o => o.InstanceName = settings.RedisInstanceName);
             services.AddOptions<RedisOutputCacheOptions>()
